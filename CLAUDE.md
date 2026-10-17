@@ -4,7 +4,7 @@ Bash and Python tools for running MySQL in production: backups to Google Cloud S
 
 ## Before changing a script
 
-- The binlog backup is documented in `mysql_prod_backup_script/README.md`: commands, design decisions, failures and their log lines, metrics, proposed dashboard and alerts, known gaps. Read it first, and keep the README, the script's `--help` and the tests in step with any change.
+- For the binlog backup, keep the script's `--help` and its tests in step with any change.
 - Bash conventions used across the scripts: `set -uo pipefail` without `-e` (each step checks its own result and returns 1), color variables for output, one function per job, `main` with a `case` on the option, a `--help` option.
 - Metrics go to node_exporter's textfile collector, written to a temporary file and renamed. Status metrics use `0` for success and `1` for failure.
 
