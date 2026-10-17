@@ -1,0 +1,9 @@
+/var/log/mysql_binlog_backup.log {
+    size 10M
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root root
+}
