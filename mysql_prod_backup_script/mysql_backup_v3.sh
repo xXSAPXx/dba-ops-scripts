@@ -1,14 +1,17 @@
 #!/bin/bash
 
 set -uo pipefail
- 
+
 # Main script for exporting LOGICAL and PHYSICAL production DB backups. (Version 3)
-# 1) Uses Percona (MySQL Shell) or Percona (Xtrabackup) to make a full instance backup.
+# 1) Uses Percona (MySQL Shell) or Percona (XtraBackup) to make a full instance backup.
 # 2) Holds the MySQL named lock 'backup_running' during the backup: the application's TRUNCATE scripts check it and do not run while it is held.
 # 3) Releases the lock upon backup completion / failure / interruption. A file lock (flock) keeps a second run of this script from starting.
 # 4) Transfers the backup to specific GCP Bucket, with a time limit (UPLOAD_TIMEOUT).
 # 5) Updates node_exporter text collector files for Grafana backup monitoring in case of SUCCESS or FAILURE.
-# 6) Backups can be performed LOCALLY by both utilities if needed. 
+# 6) Backups can be performed LOCALLY by both utilities if needed.
+# 7) Logs every backup run (normal execution and errors, with colors) to /var/log/mysql_backup.log. Rotation: mysql_backup.logrotate.example.
+#    The script logs itself, so cron's copy of the output goes to /dev/null, e.g. in /etc/cron.d/mysql_backup:
+#    0 2 * * * root /opt/scripts/mysql_backup_v3.sh --xtrabackup > /dev/null 2>&1
 
 
 # Colors for output:
@@ -19,21 +22,23 @@ RED="\e[31m"
 YELLOW="\e[33m"
 RESET="\e[0m"
 
-# Variables: 
+# Variables:
 CURRENT_TIME=`date +%Y-%m-%d-%H%M%S`
 DATA_DIR="/var/lib/mysql"
 BACKUP_DIR="/backup"
 BACKUP_DIR_SHELL="${BACKUP_DIR}/full-instance-backup-${CURRENT_TIME}-mysql-shell/"
-GCP_BINARY_PATH=$(which gcloud) || { echo -e "${RED}Error: gcloud CLI is not installed or not in PATH. Please install Google Cloud SDK.${RESET}"; }
+# Empty if gcloud is not installed: main reports it once the log has started.
+GCP_BINARY_PATH=$(which gcloud 2>/dev/null)
 GCP_BUCKET="gs://db-dela-gamification-dev-src-backup"
 TEXTFILE_COLLECTOR_DIR="/var/lib/node_exporter/textfile_collector/"
 LOCK_FILE="/var/lock/mysql_backup.lock"
+LOG_FILE="/var/log/mysql_backup.log"
 # An upload that takes longer is stopped and the transfer fails. Keep it well above the slowest normal upload (node_mysql_backup_transfer_duration_seconds):
 UPLOAD_TIMEOUT="12h"
 BACKUP_TIMESTAMP=$(($(date +%s) * 1000))
 
 
-# Function Help: 
+# Function Help:
 show_help() {
     echo "================================================================================================================================="
     echo
@@ -45,7 +50,18 @@ show_help() {
     echo -e "  ${CYAN}--mysql_shell_local${RESET}    | Perform a local backup using Percona MySQL Shell."
     echo -e "  ${CYAN}--help${RESET}                 | Display this help message."
     echo
+    echo -e "  Every backup run is logged to $LOG_FILE (with colors: less -R $LOG_FILE)."
+    echo
     echo "================================================================================================================================="
+}
+
+
+# Function to copy everything this run prints (normal execution and errors, with their colors) to the log file as well as to the screen.
+# Each run starts with a header line. Read the log with its colors: less -R on the log file.
+start_log(){
+    exec > >(tee -a "$LOG_FILE") 2>&1
+    echo
+    echo -e "${CYAN}===== $(date '+%Y-%m-%d %H:%M:%S') | $SERVER_NAME | $1 =====${RESET}"
 }
 
 
@@ -53,16 +69,16 @@ show_help() {
 
 # Function to check if machine host is (src) or (rpl):
 check_host(){
-         
-        rpl_env_type=`hostname -s | awk -F"-" '{print $(NF)}'`
-          case "$rpl_env_type" in
-                  rpl??|src)
-                          SERVER_NAME=$(hostname -s)
-                          ;;
-                  *)
-                          SERVER_NAME=$(hostname -s | cut -d"-" -f1-4)
-                          ;;
-          esac
+
+    rpl_env_type=`hostname -s | awk -F"-" '{print $(NF)}'`
+    case "$rpl_env_type" in
+        rpl??|src)
+            SERVER_NAME=$(hostname -s)
+            ;;
+        *)
+            SERVER_NAME=$(hostname -s | cut -d"-" -f1-4)
+            ;;
+    esac
 }
 
 
@@ -112,7 +128,7 @@ acquire_backup_lock(){
         return 1
     fi
 
-    # Setup Trap for safety | If the script exits / is interupted / or is killed, close the session to release the lock:
+    # Setup Trap for safety | If the script exits / is interrupted / or is killed, close the session to release the lock:
     trap 'release_backup_lock; echo -e "${RED}-- Lock released by trap. --${RESET}"' EXIT INT TERM
 
     echo -e "${GREEN}-- Lock acquired successfully. --${RESET}"
@@ -134,57 +150,58 @@ mysql_shell_backup(){
         acquire_backup_lock || return 1
         echo -e "${YELLOW}Starting MySQL Shell Backup at ${CURRENT_TIME} ${RESET}"
 
-		# Start time of the backup script:
-		START_BACKUP="$(date +%s)"
-        
-		# Perform a full instance backup with MySQL Shell: // Ensures consistency without locking!
-	    mysqlsh --login-path=local -S /var/lib/mysql/mysql.sock --js <<EOF
-        util.dumpInstance('${BACKUP_DIR_SHELL}', { 
-        bytesPerChunk: '100M', 
-        threads: 4, 
+        # Start time of the backup script:
+        START_BACKUP="$(date +%s)"
+
+        # Perform a full instance backup with MySQL Shell: // Ensures consistency without locking!
+        mysqlsh --login-path=local -S /var/lib/mysql/mysql.sock --js <<EOF
+        util.dumpInstance('${BACKUP_DIR_SHELL}', {
+        bytesPerChunk: '100M',
+        threads: 4,
         compatibility: ['strip_invalid_grants'] })
 EOF
-        # Save Backup Exit Code: 
+        # Save Backup Exit Code:
         MYSQL_SHELL_EXIT_CODE=$?
 
         # Release the lock (closing the input of the lock session ends it) and clear the trap:
-		release_backup_lock && \
-		trap - EXIT INT TERM && \
-		echo -e "${YELLOW}-- Lock named ${BACKUP_LOCK_NAME} has been released and trap removed. --${RESET}"
+        release_backup_lock && \
+        trap - EXIT INT TERM && \
+        echo -e "${YELLOW}-- Lock named ${BACKUP_LOCK_NAME} has been released and trap removed. --${RESET}"
 
         if [ $MYSQL_SHELL_EXIT_CODE -ne 0 ]; then
             echo -e "${RED}MySQL Shell Backup Failed!${RESET}"
             return 1
         fi
 
-        # Archive / Zip the MySQL Shell backup folder: 
-        time cd ${BACKUP_DIR} && tar -zcf full-instance-backup-${CURRENT_TIME}.tar.gz ${BACKUP_DIR_SHELL}
-        
-        # Save Tar exit code: 
+        # Archive the MySQL Shell backup folder without compressing it again: the dump files are already compressed (zstd).
+        # The relative name stores the folder as full-instance-backup-<time>-mysql-shell/ instead of under its full path:
+        cd ${BACKUP_DIR} && time tar -cf full-instance-backup-${CURRENT_TIME}.tar full-instance-backup-${CURRENT_TIME}-mysql-shell
+
+        # Save Tar exit code:
         FOLDER_ARCHIVE_STATUS=$?
         if [ $FOLDER_ARCHIVE_STATUS -ne 0 ]; then
             echo -e "${RED}Backup Folder Archive Failed!${RESET}"
             return 1
         fi
 
-		# End time of the backup script:
-		END_BACKUP="$(date +%s)"
+        # End time of the backup script:
+        END_BACKUP="$(date +%s)"
 
-        # Calculate backup duration: 
-		DURATION_BACKUP="$(( ($END_BACKUP - $START_BACKUP) + 2 ))"
-        echo 
-		echo -e "${YELLOW}Duration in Seconds:${RESET} $(($END_BACKUP - $START_BACKUP))"
+        # Calculate backup duration:
+        DURATION_BACKUP="$(( ($END_BACKUP - $START_BACKUP) + 2 ))"
+        echo
+        echo -e "${YELLOW}Duration in Seconds:${RESET} $(($END_BACKUP - $START_BACKUP))"
         return 0  # Success
-		
+
     else
         echo -e "${RED}Percona MySQL Shell is not installed.${RESET}"
         return 1  # Failure
-    fi 
+    fi
 }
 
 
 
-# Function for Xtrabackup Backup:
+# Function for XtraBackup Backup:
 xtrabackup_backup() {
     if command -v xtrabackup >/dev/null 2>&1; then
         acquire_backup_lock || return 1
@@ -193,10 +210,10 @@ xtrabackup_backup() {
         # Start time of the backup script:
         START_BACKUP="$(date +%s)"
 
-        # Go to BACKUP_DIR: 
+        # Go to BACKUP_DIR:
         cd ${BACKUP_DIR} || { echo -e "${RED}Error: Failed to change directory to ${BACKUP_DIR} ${RESET}"; return 1; }
 
-        # Run Xtrabackup and check for failure
+        # Run XtraBackup and check for failure
         xtrabackup --backup --datadir="${DATA_DIR}" --stream=xbstream --throttle=60 --parallel=8 --compress \
             --compress-zstd-level=1 --compress-threads=8 --login-path=local \
             > "${BACKUP_DIR}/${CURRENT_TIME}-dbfull.xbstream"
@@ -204,10 +221,10 @@ xtrabackup_backup() {
         # Save Backup Exit Code:
         XTRABACKUP_EXIT_CODE=$?
 
-		# Release the lock (closing the input of the lock session ends it) and clear the trap:
-		release_backup_lock && \
-		trap - EXIT INT TERM && \
-		echo -e "${YELLOW}-- Lock named ${BACKUP_LOCK_NAME} has been released and trap removed. --${RESET}"
+        # Release the lock (closing the input of the lock session ends it) and clear the trap:
+        release_backup_lock && \
+        trap - EXIT INT TERM && \
+        echo -e "${YELLOW}-- Lock named ${BACKUP_LOCK_NAME} has been released and trap removed. --${RESET}"
 
         if [ $XTRABACKUP_EXIT_CODE -ne 0 ]; then
             echo -e "${RED}XtraBackup failed.${RESET}"
@@ -224,108 +241,108 @@ xtrabackup_backup() {
         return 0
 
     else
-        echo -e "${RED}Percona Xtrabackup is not installed.${RESET}"
+        echo -e "${RED}Percona XtraBackup is not installed.${RESET}"
         return 1
     fi
 }
 
 
 
-# Function to Archive and Compress new backups / Delete old backups:
-manage_old_backups() { 
-time find ${BACKUP_DIR} -mindepth 1 -maxdepth 1 -type d  -name 'full-instance-backup*' -mtime +0 -exec rm -rfv {} \;
-time find ${BACKUP_DIR} -mindepth 1 -maxdepth 1 -type f  -name 'full-instance-backup*gz' -mtime +2 -exec rm -rfv {} \;
-time find ${BACKUP_DIR} -mindepth 1 -maxdepth 1 -type f  -name '*.xbstream' -mmin +1380 -exec rm -fv {} \;
-echo -e "${GREEN}Old Backups Cleaned Up.${RESET}"
+# Function to Delete old local backups (MySQL Shell archives: .tar, and .tar.gz from v2):
+manage_old_backups() {
+    time find ${BACKUP_DIR} -mindepth 1 -maxdepth 1 -type d  -name 'full-instance-backup*' -mtime +0 -exec rm -rfv {} \;
+    time find ${BACKUP_DIR} -mindepth 1 -maxdepth 1 -type f  -name 'full-instance-backup*.tar*' -mtime +2 -exec rm -rfv {} \;
+    time find ${BACKUP_DIR} -mindepth 1 -maxdepth 1 -type f  -name '*.xbstream' -mmin +1380 -exec rm -fv {} \;
+    echo -e "${GREEN}Old Backups Cleaned Up.${RESET}"
 }
 
 
 
-# Function to Transfer MySQL_Shell or XBackup to GCP Bucket: 
+# Function to Transfer MySQL Shell or XtraBackup to GCP Bucket:
 transfer_backup(){
-# Start time of the GCP Bucket transfer
-START_TRANS="$(date +%s)"
+    # Start time of the GCP Bucket transfer
+    START_TRANS="$(date +%s)"
 
-############## INITIATE MYSQL_SHELL BACKUP TRANSFER ##############
-if [ -d "$BACKUP_DIR_SHELL" ]; then
-    echo -e "${YELLOW}Initiating GCP Bucket Transfer For MySQL Shell Backup.${RESET}"
-    
-    # Upload New Backup to GCP Bucket:
-    # timeout stops an upload that hangs (network stall, stuck login), so the transfer fails instead of the run hanging forever.
-    # --kill-after kills gcloud if it ignores the stop signal. 9>&- keeps the run lock (flock) out of gcloud and its worker processes,
-    # so a worker that survives the timeout cannot block every later run:
-    timeout --kill-after=1m "$UPLOAD_TIMEOUT" ${GCP_BINARY_PATH} storage cp \
-    ${BACKUP_DIR}/full-instance-backup-${CURRENT_TIME}.tar.gz \
-    ${GCP_BUCKET}/full-instance-backup-${CURRENT_TIME}.tar.gz 9>&-
+    ############## INITIATE MYSQL_SHELL BACKUP TRANSFER ##############
+    if [ -d "$BACKUP_DIR_SHELL" ]; then
+        echo -e "${YELLOW}Initiating GCP Bucket Transfer For MySQL Shell Backup.${RESET}"
 
-    # Check Transfer Code:
-    TRANSFER_EXIT_CODE=$?
-    if [ $TRANSFER_EXIT_CODE -ne 0 ]; then
-        echo -e "${RED}Transfer to GCP Bucket Failed! (MySQL Shell)${RESET}"
-        # timeout exits with 124 when it stopped the upload, and with 137 when it had to kill it:
-        if [ $TRANSFER_EXIT_CODE -eq 124 ] || [ $TRANSFER_EXIT_CODE -eq 137 ]; then
-            echo -e "${RED}The upload did not finish within ${UPLOAD_TIMEOUT} and was stopped.${RESET}"
+        # Upload New Backup to GCP Bucket:
+        # timeout stops an upload that hangs (network stall, stuck login), so the transfer fails instead of the run hanging forever.
+        # --kill-after kills gcloud if it ignores the stop signal. 9>&- keeps the run lock (flock) out of gcloud and its worker processes,
+        # so a worker that survives the timeout cannot block every later run:
+        timeout --kill-after=1m "$UPLOAD_TIMEOUT" ${GCP_BINARY_PATH} storage cp \
+            ${BACKUP_DIR}/full-instance-backup-${CURRENT_TIME}.tar \
+            ${GCP_BUCKET}/full-instance-backup-${CURRENT_TIME}.tar 9>&-
+
+        # Check Transfer Code:
+        TRANSFER_EXIT_CODE=$?
+        if [ $TRANSFER_EXIT_CODE -ne 0 ]; then
+            echo -e "${RED}Transfer to GCP Bucket Failed! (MySQL Shell)${RESET}"
+            # timeout exits with 124 when it stopped the upload, and with 137 when it had to kill it:
+            if [ $TRANSFER_EXIT_CODE -eq 124 ] || [ $TRANSFER_EXIT_CODE -eq 137 ]; then
+                echo -e "${RED}The upload did not finish within ${UPLOAD_TIMEOUT} and was stopped.${RESET}"
+            fi
+            return 1
+        else
+            echo -e "${GREEN}Successfully Transferred Backup to GCP Bucket.${RESET}"
         fi
-        return 1
-    else
-        echo -e "${GREEN}Successfully Transfered Backup to GCP Bucket.${RESET}"
-    fi
 
-    # End Time of the Transfer.
-    END_TRANS="$(date +%s)"
+        # End Time of the Transfer.
+        END_TRANS="$(date +%s)"
 
-    # Calculate Backup Duration:
-    DURATION_TRANS="$(( ($END_TRANS - $START_TRANS) + 2 ))"
-    echo "Duration in Seconds: $(($END_TRANS - $START_TRANS))"
+        # Calculate Transfer Duration:
+        DURATION_TRANS="$(( ($END_TRANS - $START_TRANS) + 2 ))"
+        echo "Duration in Seconds: $(($END_TRANS - $START_TRANS))"
 
 
 
-#################### INITIATE XTRABACKUP TRANSFER ####################
-elif [ -f "${BACKUP_DIR}/${CURRENT_TIME}-dbfull.xbstream" ]; then
-    
-    echo -e "${YELLOW}Initiating GCP Bucket Transfer For Xtrabackup.${RESET}"
-    
-    # Upload New Backup to GCP Bucket (time limit and 9>&- as for the MySQL Shell upload above):
-    timeout --kill-after=1m "$UPLOAD_TIMEOUT" ${GCP_BINARY_PATH} storage cp \
-    ${BACKUP_DIR}/${CURRENT_TIME}-dbfull.xbstream  \
-    ${GCP_BUCKET}/${CURRENT_TIME}-dbfull.xbstream 9>&-
+    #################### INITIATE XTRABACKUP TRANSFER ####################
+    elif [ -f "${BACKUP_DIR}/${CURRENT_TIME}-dbfull.xbstream" ]; then
+
+        echo -e "${YELLOW}Initiating GCP Bucket Transfer For XtraBackup.${RESET}"
+
+        # Upload New Backup to GCP Bucket (time limit and 9>&- as for the MySQL Shell upload above):
+        timeout --kill-after=1m "$UPLOAD_TIMEOUT" ${GCP_BINARY_PATH} storage cp \
+            ${BACKUP_DIR}/${CURRENT_TIME}-dbfull.xbstream  \
+            ${GCP_BUCKET}/${CURRENT_TIME}-dbfull.xbstream 9>&-
 
 
-    # Check Transfer Code:
-    TRANSFER_EXIT_CODE=$?
-    if [ $TRANSFER_EXIT_CODE -ne 0 ]; then
-        echo -e "${RED}Transfer to GCP Bucket Failed! (XtraBackup)${RESET}"
-        # timeout exits with 124 when it stopped the upload, and with 137 when it had to kill it:
-        if [ $TRANSFER_EXIT_CODE -eq 124 ] || [ $TRANSFER_EXIT_CODE -eq 137 ]; then
-            echo -e "${RED}The upload did not finish within ${UPLOAD_TIMEOUT} and was stopped.${RESET}"
+        # Check Transfer Code:
+        TRANSFER_EXIT_CODE=$?
+        if [ $TRANSFER_EXIT_CODE -ne 0 ]; then
+            echo -e "${RED}Transfer to GCP Bucket Failed! (XtraBackup)${RESET}"
+            # timeout exits with 124 when it stopped the upload, and with 137 when it had to kill it:
+            if [ $TRANSFER_EXIT_CODE -eq 124 ] || [ $TRANSFER_EXIT_CODE -eq 137 ]; then
+                echo -e "${RED}The upload did not finish within ${UPLOAD_TIMEOUT} and was stopped.${RESET}"
+            fi
+            return 1
+        else
+            echo -e "${GREEN}Successfully Transferred Backup to GCP Bucket.${RESET}"
         fi
-        return 1
+
+        # End Time of the Transfer.
+        END_TRANS="$(date +%s)"
+
+        # Calculate Transfer Duration:
+        DURATION_TRANS="$(( ($END_TRANS - $START_TRANS) + 2 ))"
+        echo "Duration in Seconds: $(($END_TRANS - $START_TRANS))"
+
+
     else
-        echo -e "${GREEN}Successfully Transfered Backup to GCP Bucket.${RESET}"
+        echo "Error: Neither Backup Directory Exists! Exiting."
+        return 1
     fi
-
-    # End Time of the Transfer.
-    END_TRANS="$(date +%s)"
-
-    # Calculate Backup Duration:
-    DURATION_TRANS="$(( ($END_TRANS - $START_TRANS) + 2 ))"
-    echo "Duration in Seconds: $(($END_TRANS - $START_TRANS))"
-
-
-else
-    echo "Error: Neither Backup Directory Exists! Exiting."
-    return 1
-fi
 }
 
 
 
 # Function to save BACKUP monitoring metrics in case of SUCCESS:
 save_backup_metrics_success() {
-    # Add Success Backup Stats to Node_Exporter file: 
+    # Add Success Backup Stats to Node_Exporter file:
     printf "node_mysql_backup_status{instance=\"$SERVER_NAME\"} 0\n" > "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
     printf "node_mysql_backup_duration_seconds{instance=\"$SERVER_NAME\"} $DURATION_BACKUP\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
-  
+
     # Rename the temporary file atomically.
     # This avoids the node exporter seeing half a file.
     mv "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$" \
@@ -349,7 +366,7 @@ save_backup_metrics_failure() {
 
 # Function to save TRANSFER monitoring metrics in case of SUCCESS: / Update Backup Age Timestamp(ms) in a separate prom. file
 save_transfer_metrics_success() {
-    # Add Success Transfer Stats to Node_Exporter file: 
+    # Add Success Transfer Stats to Node_Exporter file:
     printf "node_mysql_backup_transfer_status{instance=\"$SERVER_NAME\"} 0\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom"
     printf "node_mysql_backup_transfer_duration_seconds{instance=\"$SERVER_NAME\"} $DURATION_TRANS\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom"
     printf "node_mysql_last_successful_backup_date{instance=\"$SERVER_NAME\"} $BACKUP_TIMESTAMP\n" > "$TEXTFILE_COLLECTOR_DIR/mysql_backup_age.prom"
@@ -366,19 +383,26 @@ save_transfer_metrics_failure() {
 
 
 function main() {
-    if [ -z "$1" ]; then
+    if [ $# -ne 1 ]; then
         echo
-        echo -e "${RED}Error: Exactly one argument is required.${RESET}"
+        echo -e "${RED}Error: Exactly one argument is required (got $#).${RESET}"
         show_help
         exit 1
-    fi    
+    fi
 
     check_host
 
     # Only one backup may run at a time (cron and manual runs, local or not). The lock is released automatically when the script exits.
-    # A run that finds the lock taken fails without touching the metrics: the backup that holds it still writes its own:
+    # A run that finds the lock taken fails without touching the metrics: the backup that holds it still writes its own.
+    # The log starts first, so these errors are logged too (--help and invalid options are not logged):
     case "$1" in
         --mysql_shell|--xtrabackup|--mysql_shell_local|--xtrabackup_local)
+            start_log "$1"
+
+            if [ -z "$GCP_BINARY_PATH" ] && [[ "$1" != *_local ]]; then
+                echo -e "${RED}Error: gcloud CLI is not installed or not in PATH. Please install Google Cloud SDK.${RESET}"
+            fi
+
             exec 9> "$LOCK_FILE" || {
                 echo -e "${RED}Error: Unable to open the lock file $LOCK_FILE.${RESET}"
                 exit 1; }
@@ -395,10 +419,10 @@ function main() {
             mysql_shell_backup
             if [ $? -eq 0 ]; then
                 save_backup_metrics_success
-                echo -e "${GREEN}Saved Success Metrics for MySQL Shell Backup.${RESET}" 
+                echo -e "${GREEN}Saved Success Metrics for MySQL Shell Backup.${RESET}"
             else
                 save_backup_metrics_failure
-                echo -e "${RED}Saved Failure Metrics for MySQL Shell Backup!${RESET}" 
+                echo -e "${RED}Saved Failure Metrics for MySQL Shell Backup!${RESET}"
                 exit 1
             fi
             manage_old_backups
@@ -408,7 +432,7 @@ function main() {
                 echo -e "${GREEN}Saved Successful Transfer Metrics for MySQL Shell Backup.${RESET}"
             else
                 save_transfer_metrics_failure
-                echo -e "${RED}Saved Failed Transfer Metrics for MySQL Shell Backup!${RESET}" 
+                echo -e "${RED}Saved Failed Transfer Metrics for MySQL Shell Backup!${RESET}"
                 exit 1
             fi
             ;;
@@ -416,10 +440,10 @@ function main() {
             xtrabackup_backup
             if [ $? -eq 0 ]; then
                 save_backup_metrics_success
-                echo -e "${GREEN}Saved Success Metrics for XtraBackup Process.${RESET}"  
+                echo -e "${GREEN}Saved Success Metrics for XtraBackup Process.${RESET}"
             else
                 save_backup_metrics_failure
-                echo -e "${RED}Saved Failure Metrics for XtraBackup Process!${RESET}" 
+                echo -e "${RED}Saved Failure Metrics for XtraBackup Process!${RESET}"
                 exit 1
             fi
             manage_old_backups
@@ -450,12 +474,12 @@ function main() {
                 echo -e  "${RED}Local MySQL Shell Backup Failed!${RESET}"
                 exit 1
             fi
-            ;;        
+            ;;
         --help)
             show_help
             ;;
         *)
-            echo 
+            echo
             echo -e "${RED}Error: Invalid argument '$1'.${RESET}"
             show_help
             exit 1
@@ -463,6 +487,6 @@ function main() {
     esac
 }
 
-main "${1:-}"
+main "$@"
 
 
