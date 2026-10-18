@@ -199,8 +199,13 @@ fresh; run --xtrabackup
 check "next run is not blocked by a leftover upload process" 0 "Saved Successful Transfer Metrics for XtraBackup"
 
 echo "--- MySQL Shell"
-fresh; run --mysql_shell
-check "MySQL Shell backup and upload succeed" 0 "Saved Successful Transfer Metrics for MySQL Shell Backup" '[ "$(find "$T/bucket" -name "full-instance-backup-*.tar.gz" | wc -l)" = 1 ] && [ "$(cat "$T/lock_during_backup")" = held ] && db_lock_released'
+fresh
+touch -d "4 days ago" "$T/backup/full-instance-backup-old.tar" "$T/backup/full-instance-backup-old.tar.gz"
+touch -d "1 day ago" "$T/backup/full-instance-backup-recent.tar"
+run --mysql_shell
+check "MySQL Shell backup and upload succeed" 0 "Saved Successful Transfer Metrics for MySQL Shell Backup" '[ "$(find "$T/bucket" -name "full-instance-backup-*.tar" | wc -l)" = 1 ] && [ "$(cat "$T/lock_during_backup")" = held ] && db_lock_released'
+check "the archive is a plain tar (not compressed again) with the dump folder at its top" - "" 'A=$(find "$T/bucket" -name "full-instance-backup-*.tar"); ! gzip -t "$A" 2>/dev/null && tar -tf "$A" | grep -q "^full-instance-backup-.*-mysql-shell/@.json$" && ! tar -tf "$A" | grep -qv "^full-instance-backup-.*-mysql-shell/"'
+check "cleanup removes .tar and .tar.gz archives older than 3 days, keeps newer ones" - "" '[ ! -e "$T/backup/full-instance-backup-old.tar" ] && [ ! -e "$T/backup/full-instance-backup-old.tar.gz" ] && [ -e "$T/backup/full-instance-backup-recent.tar" ]'
 fresh; MYSQLSH_FAIL=1 run --mysql_shell
 check "MySQL Shell fails: failure metrics, lock released" 1 "MySQL Shell Backup Failed!" '[ "$(metric node_mysql_backup_status)" = 1 ] && db_lock_released'
 fresh; UPLOAD_HANG=1 run --mysql_shell
@@ -212,7 +217,9 @@ run --xtrabackup_local
 check "--xtrabackup_local: backup only, no upload, metrics untouched" 0 "Local XtraBackup Finished Successfully" '[ "$(uploads)" = 0 ] && cmp -s "$T/status.before" "$T/textfile/mysql_backup_status.prom" && db_lock_released'
 fresh; run --mysql_shell_local
 check "--mysql_shell_local: backup only, no upload" 0 "Local MySQL Shell Backup Finished Successfully" '[ "$(uploads)" = 0 ]'
-run;              check "no option is rejected" 1 "Exactly one argument is required"
+run;              check "no option is rejected" 1 "Exactly one argument is required (got 0)"
+fresh; run --xtrabackup --mysql_shell
+check "two options are rejected, nothing runs" 1 "Exactly one argument is required (got 2)" '[ ! -e "$T/xtrabackup.args" ] && [ "$(uploads)" = 0 ]'
 run --full;       check "an unknown option is rejected" 1 "Invalid argument '--full'"
 cat "$T/out_a" >> "$T/all_out"; cp "$T/all_out" "$T/out"; RC=-
 check "no run printed a shell error" - "" '! grep -nE "unbound variable|Bad file descriptor|command not found|syntax error|ambiguous redirect" "$T/all_out"'
