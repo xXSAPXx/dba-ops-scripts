@@ -1,11 +1,7 @@
 #!/bin/bash
 
 set -uo pipefail
-
-# The backups hold the whole database: files and folders this script (and xtrabackup, mysqlsh, tar) creates are readable by their owner (root) only.
-# The node_exporter metric files are made readable again where they are written:
-umask 077
-
+ 
 # Main script for exporting LOGICAL and PHYSICAL production DB backups. (Version 3)
 # 1) Uses Percona (MySQL Shell) or Percona (Xtrabackup) to make a full instance backup.
 # 2) Holds the MySQL named lock 'backup_running' during the backup: the application's TRUNCATE scripts check it and do not run while it is held.
@@ -329,10 +325,7 @@ save_backup_metrics_success() {
     # Add Success Backup Stats to Node_Exporter file: 
     printf "node_mysql_backup_status{instance=\"$SERVER_NAME\"} 0\n" > "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
     printf "node_mysql_backup_duration_seconds{instance=\"$SERVER_NAME\"} $DURATION_BACKUP\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
-
-    # umask 077 makes new files readable by root only; node_exporter usually runs as its own user:
-    chmod 644 "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
-
+  
     # Rename the temporary file atomically.
     # This avoids the node exporter seeing half a file.
     mv "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$" \
@@ -347,9 +340,6 @@ save_backup_metrics_failure() {
     printf "node_mysql_backup_transfer_status{instance=\"$SERVER_NAME\"} 1\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
     printf "node_mysql_backup_transfer_duration_seconds{instance=\"$SERVER_NAME\"} 1\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
 
-    # umask 077 makes new files readable by root only; node_exporter usually runs as its own user:
-    chmod 644 "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
-
     # Rename the temporary file atomically.
     # This avoids the node exporter seeing half a file.
     mv "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$" \
@@ -363,8 +353,6 @@ save_transfer_metrics_success() {
     printf "node_mysql_backup_transfer_status{instance=\"$SERVER_NAME\"} 0\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom"
     printf "node_mysql_backup_transfer_duration_seconds{instance=\"$SERVER_NAME\"} $DURATION_TRANS\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom"
     printf "node_mysql_last_successful_backup_date{instance=\"$SERVER_NAME\"} $BACKUP_TIMESTAMP\n" > "$TEXTFILE_COLLECTOR_DIR/mysql_backup_age.prom"
-    # Readable for node_exporter if the file was just created (umask 077):
-    chmod 644 "$TEXTFILE_COLLECTOR_DIR/mysql_backup_age.prom"
 }
 
 
