@@ -1,12 +1,16 @@
 #!/bin/bash
 
 set -uo pipefail
- 
-# Main script for exporting LOGICAL and PHYSICAL production DB backups. (Version 2)
+
+# The backups hold the whole database: files and folders this script (and xtrabackup, mysqlsh, tar) creates are readable by their owner (root) only.
+# The node_exporter metric files are made readable again where they are written:
+umask 077
+
+# Main script for exporting LOGICAL and PHYSICAL production DB backups. (Version 3)
 # 1) Uses Percona (MySQL Shell) or Percona (Xtrabackup) to make a full instance backup.
-# 2) Aqquires a named lock to prevent concurrent backups / DDL operations during backup. 
-# 3) Releases the lock upon backup completion / failure / interuption.
-# 4) Transfers the backup to specific GCP Bucket.
+# 2) Holds the MySQL named lock 'backup_running' during the backup: the application's TRUNCATE scripts check it and do not run while it is held.
+# 3) Releases the lock upon backup completion / failure / interruption. A file lock (flock) keeps a second run of this script from starting.
+# 4) Transfers the backup to specific GCP Bucket, with a time limit (UPLOAD_TIMEOUT).
 # 5) Updates node_exporter text collector files for Grafana backup monitoring in case of SUCCESS or FAILURE.
 # 6) Backups can be performed LOCALLY by both utilities if needed. 
 
@@ -27,6 +31,9 @@ BACKUP_DIR_SHELL="${BACKUP_DIR}/full-instance-backup-${CURRENT_TIME}-mysql-shell
 GCP_BINARY_PATH=$(which gcloud) || { echo -e "${RED}Error: gcloud CLI is not installed or not in PATH. Please install Google Cloud SDK.${RESET}"; }
 GCP_BUCKET="gs://db-dela-gamification-dev-src-backup"
 TEXTFILE_COLLECTOR_DIR="/var/lib/node_exporter/textfile_collector/"
+LOCK_FILE="/var/lock/mysql_backup.lock"
+# An upload that takes longer is stopped and the transfer fails. Keep it well above the slowest normal upload (node_mysql_backup_transfer_duration_seconds):
+UPLOAD_TIMEOUT="12h"
 BACKUP_TIMESTAMP=$(($(date +%s) * 1000))
 
 
@@ -58,8 +65,67 @@ check_host(){
                           ;;
                   *)
                           SERVER_NAME=$(hostname -s | cut -d"-" -f1-4)
-                          ;;              
+                          ;;
           esac
+}
+
+
+
+# Function to take the MySQL named lock 'backup_running' for the duration of the backup (the application's TRUNCATE scripts check it):
+acquire_backup_lock(){
+    BACKUP_LOCK_NAME="backup_running"
+
+    echo -e "${YELLOW}-- Attempting to acquire database lock named: ${BACKUP_LOCK_NAME} --${RESET}"
+
+    # The lock session writes its answers to this file (--unbuffered: at once), so the script can read whether GET_LOCK succeeded:
+    local LOCK_ANSWER_FILE
+    LOCK_ANSWER_FILE=$(mktemp -t mysql_backup_lock.XXXXXX) || {
+        echo -e "${RED}-- Error: Unable to create a temporary file for the lock session. --${RESET}"
+        return 1; }
+
+    # Start a background process to hold the lock: a mysql session that ends, and releases the lock, when its input (fd 3) is closed.
+    # xtrabackup / mysqlsh inherit fd 3, so if this script is killed the lock stays held until the backup tool has finished too:
+    exec 3> >(mysql --login-path=local -N --unbuffered > "$LOCK_ANSWER_FILE")
+    local LOCK_SESSION_PID="${!:-}"
+
+    # Bump the timeouts for THIS SESSION ONLY (12 hours = 43200 seconds), so the idle session is not disconnected during a long backup.
+    # GET_LOCK(...,0) takes the lock or returns 0 at once: checking and taking it is one step, so two sessions can never both get it.
+    # SIGPIPE is ignored for this one write, so a session that already died (wrong login, MySQL down) cannot kill the script:
+    trap '' PIPE
+    echo "SET SESSION wait_timeout=43200; SET SESSION interactive_timeout=43200; SELECT GET_LOCK('${BACKUP_LOCK_NAME}',0);" >&3 2>/dev/null
+    trap - PIPE
+
+    # Wait up to 60 s for the answer, and stop early if the session has already ended (MySQL prints its error above):
+    local LOCK_RESULT="" WAITED=0
+    while [ "$WAITED" -lt 600 ]; do
+        read -r LOCK_RESULT < "$LOCK_ANSWER_FILE"
+        [ -n "$LOCK_RESULT" ] && break
+        [ -n "$LOCK_SESSION_PID" ] && ! kill -0 "$LOCK_SESSION_PID" 2>/dev/null && break
+        sleep 0.1
+        WAITED=$((WAITED + 1))
+    done
+    rm -f "$LOCK_ANSWER_FILE"
+
+    if [ "$LOCK_RESULT" != "1" ]; then
+        if [ "$LOCK_RESULT" == "0" ]; then
+            echo -e "${RED}-- Error: Could not acquire lock: ${BACKUP_LOCK_NAME} is held by another session (another backup, or an application TRUNCATE script). --${RESET}"
+        else
+            echo -e "${RED}-- Error: Could not acquire lock: no answer from MySQL to GET_LOCK (got: '${LOCK_RESULT}'). See the MySQL error above, if any. --${RESET}"
+        fi
+        release_backup_lock
+        return 1
+    fi
+
+    # Setup Trap for safety | If the script exits / is interupted / or is killed, close the session to release the lock:
+    trap 'release_backup_lock; echo -e "${RED}-- Lock released by trap. --${RESET}"' EXIT INT TERM
+
+    echo -e "${GREEN}-- Lock acquired successfully. --${RESET}"
+}
+
+
+# Function to release the MySQL named lock: closing fd 3 ends the lock session, and MySQL releases the lock with it (safe to call twice):
+release_backup_lock(){
+    exec 3>&-
 }
 
 
@@ -69,33 +135,7 @@ mysql_shell_backup(){
 
     command -v mysqlsh >/dev/null 2>&1
     if [ $? -eq 0 ]; then
-        local BACKUP_LOCK_NAME="backup_running"
-
-        echo -e "${YELLOW}-- Attempting to acquire database lock named: ${BACKUP_LOCK_NAME} --${RESET}"
-
-        # Start a background process to hold the lock | First, grab the lock. Then, wait indefinitely (read) until the pipe closes: 
-        exec 3> >(mysql --login-path=local -N)
-
-        # Verify the lock is not used ATM | We check if a session with this lock exists:
-        local BACKUP_LOCK_STATUS=$(mysql --login-path=local -N -e "SELECT IS_FREE_LOCK('${BACKUP_LOCK_NAME}');")
-        
-        if [ "$BACKUP_LOCK_STATUS" == '0' ] || [ -z "$BACKUP_LOCK_STATUS" ]; then
-            echo -e "${RED}-- Error: Could not acquire lock. Is another backup running? --${RESET}"
-            exec 3>&- # Close the file descriptor / mysql connection
-            return 1
-        fi
-		
-		# 1. Bump the timeouts for THIS SESSION ONLY (12 hours = 43200 seconds)
-		echo "SET SESSION wait_timeout=43200;" >&3
-		echo "SET SESSION interactive_timeout=43200;" >&3
-		
-        # Request / GET the lock:
-        echo "SELECT GET_LOCK('${BACKUP_LOCK_NAME}',0);" >&3
-		
-        # Setup Trap for safety | If the script exits / is interupted / or is killed, close the file descriptor to release the lock:
-        trap 'exec 3>&-; echo -e "${RED}-- Lock released by trap. --${RESET}"' EXIT INT TERM
-
-        echo -e "${GREEN}-- Lock acquired successfully. --${RESET}"
+        acquire_backup_lock || return 1
         echo -e "${YELLOW}Starting MySQL Shell Backup at ${CURRENT_TIME} ${RESET}"
 
 		# Start time of the backup script:
@@ -111,8 +151,8 @@ EOF
         # Save Backup Exit Code: 
         MYSQL_SHELL_EXIT_CODE=$?
 
-        # Cleanup file descriptor and release lock / Closing the file descriptor kills the MySQL session and releases the lock / Clear the trap
-		exec 3>&- && \
+        # Release the lock (closing the input of the lock session ends it) and clear the trap:
+		release_backup_lock && \
 		trap - EXIT INT TERM && \
 		echo -e "${YELLOW}-- Lock named ${BACKUP_LOCK_NAME} has been released and trap removed. --${RESET}"
 
@@ -151,33 +191,7 @@ EOF
 # Function for Xtrabackup Backup:
 xtrabackup_backup() {
     if command -v xtrabackup >/dev/null 2>&1; then
-        local BACKUP_LOCK_NAME="backup_running"
-
-        echo -e "${YELLOW}-- Attempting to acquire database lock named: ${BACKUP_LOCK_NAME} --${RESET}"
-
-        # Start a background process to hold the lock | First, grab the lock. Then, wait indefinitely (read) until the pipe closes: 
-        exec 3> >(mysql --login-path=local -N)
-
-        # Verify the lock is not used ATM | We check if a session with this lock exists:
-        local BACKUP_LOCK_STATUS=$(mysql --login-path=local -N -e "SELECT IS_FREE_LOCK('${BACKUP_LOCK_NAME}');")
-        
-        if [ "$BACKUP_LOCK_STATUS" == '0' ] || [ -z "$BACKUP_LOCK_STATUS" ]; then
-            echo -e "${RED}-- Error: Could not acquire lock. Is another backup running? --${RESET}"
-            exec 3>&- # Close the file descriptor / mysql connection
-            return 1
-        fi
-		
-		# 1. Bump the timeouts for THIS SESSION ONLY (12 hours = 43200 seconds)
-		echo "SET SESSION wait_timeout=43200;" >&3
-		echo "SET SESSION interactive_timeout=43200;" >&3
-		
-        # Request / GET the lock:
-        echo "SELECT GET_LOCK('${BACKUP_LOCK_NAME}',0);" >&3
-		
-        # Setup Trap for safety | If the script exits / is interupted / or is killed, close the file descriptor to release the lock:
-        trap 'exec 3>&-; echo -e "${RED}-- Lock released by trap. --${RESET}"' EXIT INT TERM
-
-        echo -e "${GREEN}-- Lock acquired successfully. --${RESET}"
+        acquire_backup_lock || return 1
         echo -e "${YELLOW}Starting XtraBackup at ${CURRENT_TIME} ${RESET}"
 
         # Start time of the backup script:
@@ -188,14 +202,14 @@ xtrabackup_backup() {
 
         # Run Xtrabackup and check for failure
         xtrabackup --backup --datadir="${DATA_DIR}" --stream=xbstream --throttle=60 --parallel=8 --compress \
-            --compress-zstd-level=1 --compress-threads=8 --no-server-version-check --login-path=local \
+            --compress-zstd-level=1 --compress-threads=8 --login-path=local \
             > "${BACKUP_DIR}/${CURRENT_TIME}-dbfull.xbstream"
 
         # Save Backup Exit Code:
         XTRABACKUP_EXIT_CODE=$?
 
-		# Cleanup file descriptor and release lock / Closing the file descriptor kills the MySQL session and releases the lock / Clear the trap
-		exec 3>&- && \
+		# Release the lock (closing the input of the lock session ends it) and clear the trap:
+		release_backup_lock && \
 		trap - EXIT INT TERM && \
 		echo -e "${YELLOW}-- Lock named ${BACKUP_LOCK_NAME} has been released and trap removed. --${RESET}"
 
@@ -240,15 +254,22 @@ START_TRANS="$(date +%s)"
 if [ -d "$BACKUP_DIR_SHELL" ]; then
     echo -e "${YELLOW}Initiating GCP Bucket Transfer For MySQL Shell Backup.${RESET}"
     
-    # Upload New Backup to GCP Bucket: 
-    ${GCP_BINARY_PATH} storage cp \
+    # Upload New Backup to GCP Bucket:
+    # timeout stops an upload that hangs (network stall, stuck login), so the transfer fails instead of the run hanging forever.
+    # --kill-after kills gcloud if it ignores the stop signal. 9>&- keeps the run lock (flock) out of gcloud and its worker processes,
+    # so a worker that survives the timeout cannot block every later run:
+    timeout --kill-after=1m "$UPLOAD_TIMEOUT" ${GCP_BINARY_PATH} storage cp \
     ${BACKUP_DIR}/full-instance-backup-${CURRENT_TIME}.tar.gz \
-    ${GCP_BUCKET}/full-instance-backup-${CURRENT_TIME}.tar.gz
+    ${GCP_BUCKET}/full-instance-backup-${CURRENT_TIME}.tar.gz 9>&-
 
-    # Check Transfer Code: 
+    # Check Transfer Code:
     TRANSFER_EXIT_CODE=$?
     if [ $TRANSFER_EXIT_CODE -ne 0 ]; then
         echo -e "${RED}Transfer to GCP Bucket Failed! (MySQL Shell)${RESET}"
+        # timeout exits with 124 when it stopped the upload, and with 137 when it had to kill it:
+        if [ $TRANSFER_EXIT_CODE -eq 124 ] || [ $TRANSFER_EXIT_CODE -eq 137 ]; then
+            echo -e "${RED}The upload did not finish within ${UPLOAD_TIMEOUT} and was stopped.${RESET}"
+        fi
         return 1
     else
         echo -e "${GREEN}Successfully Transfered Backup to GCP Bucket.${RESET}"
@@ -268,16 +289,20 @@ elif [ -f "${BACKUP_DIR}/${CURRENT_TIME}-dbfull.xbstream" ]; then
     
     echo -e "${YELLOW}Initiating GCP Bucket Transfer For Xtrabackup.${RESET}"
     
-    # Upload New Backup to GCP Bucket:
-    ${GCP_BINARY_PATH} storage cp \
+    # Upload New Backup to GCP Bucket (time limit and 9>&- as for the MySQL Shell upload above):
+    timeout --kill-after=1m "$UPLOAD_TIMEOUT" ${GCP_BINARY_PATH} storage cp \
     ${BACKUP_DIR}/${CURRENT_TIME}-dbfull.xbstream  \
-    ${GCP_BUCKET}/${CURRENT_TIME}-dbfull.xbstream
+    ${GCP_BUCKET}/${CURRENT_TIME}-dbfull.xbstream 9>&-
 
 
-    # Check Transfer Code: 
+    # Check Transfer Code:
     TRANSFER_EXIT_CODE=$?
     if [ $TRANSFER_EXIT_CODE -ne 0 ]; then
         echo -e "${RED}Transfer to GCP Bucket Failed! (XtraBackup)${RESET}"
+        # timeout exits with 124 when it stopped the upload, and with 137 when it had to kill it:
+        if [ $TRANSFER_EXIT_CODE -eq 124 ] || [ $TRANSFER_EXIT_CODE -eq 137 ]; then
+            echo -e "${RED}The upload did not finish within ${UPLOAD_TIMEOUT} and was stopped.${RESET}"
+        fi
         return 1
     else
         echo -e "${GREEN}Successfully Transfered Backup to GCP Bucket.${RESET}"
@@ -304,7 +329,10 @@ save_backup_metrics_success() {
     # Add Success Backup Stats to Node_Exporter file: 
     printf "node_mysql_backup_status{instance=\"$SERVER_NAME\"} 0\n" > "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
     printf "node_mysql_backup_duration_seconds{instance=\"$SERVER_NAME\"} $DURATION_BACKUP\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
-  
+
+    # umask 077 makes new files readable by root only; node_exporter usually runs as its own user:
+    chmod 644 "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
+
     # Rename the temporary file atomically.
     # This avoids the node exporter seeing half a file.
     mv "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$" \
@@ -319,6 +347,9 @@ save_backup_metrics_failure() {
     printf "node_mysql_backup_transfer_status{instance=\"$SERVER_NAME\"} 1\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
     printf "node_mysql_backup_transfer_duration_seconds{instance=\"$SERVER_NAME\"} 1\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
 
+    # umask 077 makes new files readable by root only; node_exporter usually runs as its own user:
+    chmod 644 "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
+
     # Rename the temporary file atomically.
     # This avoids the node exporter seeing half a file.
     mv "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$" \
@@ -332,6 +363,8 @@ save_transfer_metrics_success() {
     printf "node_mysql_backup_transfer_status{instance=\"$SERVER_NAME\"} 0\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom"
     printf "node_mysql_backup_transfer_duration_seconds{instance=\"$SERVER_NAME\"} $DURATION_TRANS\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom"
     printf "node_mysql_last_successful_backup_date{instance=\"$SERVER_NAME\"} $BACKUP_TIMESTAMP\n" > "$TEXTFILE_COLLECTOR_DIR/mysql_backup_age.prom"
+    # Readable for node_exporter if the file was just created (umask 077):
+    chmod 644 "$TEXTFILE_COLLECTOR_DIR/mysql_backup_age.prom"
 }
 
 
@@ -353,7 +386,22 @@ function main() {
     fi    
 
     check_host
-  
+
+    # Only one backup may run at a time (cron and manual runs, local or not). The lock is released automatically when the script exits.
+    # A run that finds the lock taken fails without touching the metrics: the backup that holds it still writes its own:
+    case "$1" in
+        --mysql_shell|--xtrabackup|--mysql_shell_local|--xtrabackup_local)
+            exec 9> "$LOCK_FILE" || {
+                echo -e "${RED}Error: Unable to open the lock file $LOCK_FILE.${RESET}"
+                exit 1; }
+
+            if ! flock -n 9; then
+                echo -e "${RED}Error: Another backup is still running (it holds $LOCK_FILE), so this one does not start.${RESET}"
+                exit 1
+            fi
+            ;;
+    esac
+
     case "$1" in
         --mysql_shell)
             mysql_shell_backup
