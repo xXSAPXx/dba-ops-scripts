@@ -30,13 +30,14 @@ sed -e "s|^DATA_DIR=.*|DATA_DIR=\"$T/datadir\"|" \
     -e "s|^GCP_BUCKET=.*|GCP_BUCKET=\"gs://test-bucket\"|" \
     -e "s|^TEXTFILE_COLLECTOR_DIR=.*|TEXTFILE_COLLECTOR_DIR=\"$T/textfile/\"|" \
     -e "s|^LOCK_FILE=.*|LOCK_FILE=\"$T/run.lock\"|" \
+    -e "s|^LOG_FILE=.*|LOG_FILE=\"$T/backup.log\"|" \
     -e 's|^UPLOAD_TIMEOUT=.*|UPLOAD_TIMEOUT="2s"|' \
     -e 's|--kill-after=1m|--kill-after=2s|' \
     -e 's|while \[ "\$WAITED" -lt 600 \]|while [ "$WAITED" -lt 30 ]|' \
     -e "s|^\( *\)timeout --kill-after|\1${TIMEOUT_BIN:-timeout} --kill-after|" "$SRC" > "$T/backup.sh"
 
-REPLACED=$(grep -cE "^(DATA_DIR|BACKUP_DIR|GCP_BUCKET|TEXTFILE_COLLECTOR_DIR|LOCK_FILE|UPLOAD_TIMEOUT)=" "$T/backup.sh")
-[ "$REPLACED" -eq 6 ] && [ "$(grep -c -- "${TIMEOUT_BIN:-timeout} --kill-after=2s" "$T/backup.sh")" -eq 2 ] && grep -q 'while \[ "$WAITED" -lt 30 \]' "$T/backup.sh" || {
+REPLACED=$(grep -cE "^(DATA_DIR|BACKUP_DIR|GCP_BUCKET|TEXTFILE_COLLECTOR_DIR|LOCK_FILE|LOG_FILE|UPLOAD_TIMEOUT)=" "$T/backup.sh")
+[ "$REPLACED" -eq 7 ] && [ "$(grep -c -- "${TIMEOUT_BIN:-timeout} --kill-after=2s" "$T/backup.sh")" -eq 2 ] && grep -q 'while \[ "$WAITED" -lt 30 \]' "$T/backup.sh" || {
     echo "FAIL  could not point the script's settings at the test directory (did a variable name change?)"; exit 1; }
 # The same script with another run lock file: two runs that the run lock cannot stop (as if started on two hosts):
 sed "s|^LOCK_FILE=.*|LOCK_FILE=\"$T/other.lock\"|" "$T/backup.sh" > "$T/backup_otherlock.sh"
@@ -106,7 +107,8 @@ export T PATH="$T/bin:$PATH"
 
 
 # run SCRIPT OPTION: one run; its output (without colors) goes to $T/out, its exit code to RC
-run_script(){ local s="$1"; shift; bash "$s" "$@" > "$T/out" 2>&1; RC=$?; sed -i 's/\x1b\[[0-9;]*m//g' "$T/out"; cat "$T/out" >> "$T/all_out"; }
+# The output goes through tee (the log), which can finish a moment after the script, hence the short wait:
+run_script(){ local s="$1"; shift; bash "$s" "$@" > "$T/out" 2>&1; RC=$?; sleep 0.3; sed -i 's/\x1b\[[0-9;]*m//g' "$T/out"; cat "$T/out" >> "$T/all_out"; }
 run(){ run_script "$T/backup.sh" "$@"; }
 # fresh: empty backup folder, bucket and records of the last run (metrics stay)
 fresh(){ rm -rf "$T"/backup/* "$T"/bucket/* "$T/xtrabackup.args" "$T/xtrabackup.started" "$T/lock_during_backup" "$T/gcloud_has_fd9"; }
@@ -160,7 +162,7 @@ check "no answer to GET_LOCK: fails after the wait" 1 "no answer from MySQL to G
 fresh; XTRABACKUP_SLEEP=3 bash "$T/backup_otherlock.sh" --xtrabackup > "$T/out_a" 2>&1 & A=$!
 wait_for "$T/xtrabackup.started"; run --xtrabackup
 check "two backups that the run lock cannot stop: only one gets the named lock" 1 "is held by another session" ''
-wait $A; RC=$?; cp "$T/out_a" "$T/out"
+wait $A; RC=$?; sleep 0.3; cp "$T/out_a" "$T/out"
 check "the other backup finishes normally" 0 "Saved Successful Transfer Metrics for XtraBackup" 'db_lock_released'
 
 fresh; XTRABACKUP_FAIL=1 run --xtrabackup
@@ -179,7 +181,7 @@ fresh; XTRABACKUP_SLEEP=2 bash "$T/backup.sh" --xtrabackup > "$T/out_a" 2>&1 & A
 wait_for "$T/xtrabackup.started"; BEFORE=$(cat "$T/textfile/mysql_backup_status.prom")
 run --xtrabackup
 check "second run while one is running: refused, metrics untouched" 1 "Another backup is still running" '[ "$(cat "$T/textfile/mysql_backup_status.prom")" = "$BEFORE" ]'
-wait $A; RC=$?; cp "$T/out_a" "$T/out"
+wait $A; RC=$?; sleep 0.3; cp "$T/out_a" "$T/out"
 check "the first run finishes normally" 0 "Saved Successful Transfer Metrics for XtraBackup"
 run_script "$T/backup_badlock.sh" --xtrabackup
 check "run lock file cannot be opened: the run fails" 1 "Unable to open the lock file"
@@ -223,6 +225,18 @@ check "two options are rejected, nothing runs" 1 "Exactly one argument is requir
 run --full;       check "an unknown option is rejected" 1 "Invalid argument '--full'"
 cat "$T/out_a" >> "$T/all_out"; cp "$T/all_out" "$T/out"; RC=-
 check "no run printed a shell error" - "" '! grep -nE "unbound variable|Bad file descriptor|command not found|syntax error|ambiguous redirect" "$T/all_out"'
+
+echo "--- the log"
+L="$T/backup.log"
+check "every backup run is logged, with its header line" - "" '[ "$(grep -c "| db-test-prod-src | --" "$L")" -ge 20 ] && grep -q "| db-test-prod-src | --mysql_shell_local =====" "$L"'
+check "the log keeps earlier runs, refused ones too, with their colors" - "" 'grep -q "Saved Successful Transfer Metrics for MySQL Shell Backup" "$L" && grep -q "Another backup is still running" "$L" && grep -q $'"'"'\e\['"'"' "$L"'
+check "--help, unknown and missing options are not logged" - "" '! grep -qE "\| db-test-prod-src \| (--help|--full|) =====" "$L"'
+mv "$T/bin/gcloud" "$T/bin/gcloud.off"
+fresh; run --xtrabackup
+check "gcloud missing: the error reaches the log, the upload fails" 1 "gcloud CLI is not installed" 'grep -q "gcloud CLI is not installed" "$L" && [ "$(metric node_mysql_backup_transfer_status)" = 1 ]'
+fresh; run --xtrabackup_local
+check "gcloud missing: local backups do not report it" 0 "Local XtraBackup Finished Successfully" '! grep -q "gcloud CLI is not installed" "$T/out"'
+mv "$T/bin/gcloud.off" "$T/bin/gcloud"
 
 echo
 echo "$PASSED passed, $FAILED failed"

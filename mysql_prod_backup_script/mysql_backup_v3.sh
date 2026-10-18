@@ -9,6 +9,9 @@ set -uo pipefail
 # 4) Transfers the backup to specific GCP Bucket, with a time limit (UPLOAD_TIMEOUT).
 # 5) Updates node_exporter text collector files for Grafana backup monitoring in case of SUCCESS or FAILURE.
 # 6) Backups can be performed LOCALLY by both utilities if needed.
+# 7) Logs every backup run (normal execution and errors, with colors) to /var/log/mysql_backup.log. Rotation: mysql_backup.logrotate.example.
+#    The script logs itself, so cron's copy of the output goes to /dev/null, e.g. in /etc/cron.d/mysql_backup:
+#    0 2 * * * root /opt/scripts/mysql_backup_v3.sh --xtrabackup > /dev/null 2>&1
 
 
 # Colors for output:
@@ -24,10 +27,12 @@ CURRENT_TIME=`date +%Y-%m-%d-%H%M%S`
 DATA_DIR="/var/lib/mysql"
 BACKUP_DIR="/backup"
 BACKUP_DIR_SHELL="${BACKUP_DIR}/full-instance-backup-${CURRENT_TIME}-mysql-shell/"
-GCP_BINARY_PATH=$(which gcloud) || { echo -e "${RED}Error: gcloud CLI is not installed or not in PATH. Please install Google Cloud SDK.${RESET}"; }
+# Empty if gcloud is not installed: main reports it once the log has started.
+GCP_BINARY_PATH=$(which gcloud 2>/dev/null)
 GCP_BUCKET="gs://db-dela-gamification-dev-src-backup"
 TEXTFILE_COLLECTOR_DIR="/var/lib/node_exporter/textfile_collector/"
 LOCK_FILE="/var/lock/mysql_backup.lock"
+LOG_FILE="/var/log/mysql_backup.log"
 # An upload that takes longer is stopped and the transfer fails. Keep it well above the slowest normal upload (node_mysql_backup_transfer_duration_seconds):
 UPLOAD_TIMEOUT="12h"
 BACKUP_TIMESTAMP=$(($(date +%s) * 1000))
@@ -45,7 +50,18 @@ show_help() {
     echo -e "  ${CYAN}--mysql_shell_local${RESET}    | Perform a local backup using Percona MySQL Shell."
     echo -e "  ${CYAN}--help${RESET}                 | Display this help message."
     echo
+    echo -e "  Every backup run is logged to $LOG_FILE (with colors: less -R $LOG_FILE)."
+    echo
     echo "================================================================================================================================="
+}
+
+
+# Function to copy everything this run prints (normal execution and errors, with their colors) to the log file as well as to the screen.
+# Each run starts with a header line. Read the log with its colors: less -R on the log file.
+start_log(){
+    exec > >(tee -a "$LOG_FILE") 2>&1
+    echo
+    echo -e "${CYAN}===== $(date '+%Y-%m-%d %H:%M:%S') | $SERVER_NAME | $1 =====${RESET}"
 }
 
 
@@ -377,9 +393,16 @@ function main() {
     check_host
 
     # Only one backup may run at a time (cron and manual runs, local or not). The lock is released automatically when the script exits.
-    # A run that finds the lock taken fails without touching the metrics: the backup that holds it still writes its own:
+    # A run that finds the lock taken fails without touching the metrics: the backup that holds it still writes its own.
+    # The log starts first, so these errors are logged too (--help and invalid options are not logged):
     case "$1" in
         --mysql_shell|--xtrabackup|--mysql_shell_local|--xtrabackup_local)
+            start_log "$1"
+
+            if [ -z "$GCP_BINARY_PATH" ] && [[ "$1" != *_local ]]; then
+                echo -e "${RED}Error: gcloud CLI is not installed or not in PATH. Please install Google Cloud SDK.${RESET}"
+            fi
+
             exec 9> "$LOCK_FILE" || {
                 echo -e "${RED}Error: Unable to open the lock file $LOCK_FILE.${RESET}"
                 exit 1; }
