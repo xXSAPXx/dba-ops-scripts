@@ -2,12 +2,17 @@
 
 set -uo pipefail
 
+# No core dumps: a crashing xbcrypt would write its memory, and the encryption key in it, to disk (systemd-coredump):
+ulimit -c 0
+
 # The AWS version of mysql_binlog_backup_v2.sh: the same logic, with the upload to Amazon S3 instead of Google Cloud Storage.
 # The AWS CLI takes its credentials from the server's IAM role.
 # The script is used to backup MySQL binlog files to Amazon S3:
 # A person starts a binlog chain once with --init_binlog_chain, then cron runs --continuous_binlog_backup every 15-30 minutes.
 # It writes binlog backup metrics in /node_exporter/textfile_collector/ to be scraped by Prometheus.
 # It logs every run (normal execution and errors, with colors) to /var/log/mysql_binlog_backup.log. Rotation: mysql_binlog_backup.logrotate.example.
+# It encrypts every binary log (xbcrypt, AES256) before the upload, with a key read from AWS Secrets Manager: the bucket holds only
+# <binary log>.xbcrypt files. To decrypt one: XBCRYPT_ENCRYPTION_KEY=<key> xbcrypt --decrypt --encrypt-algo=AES256 < <file>.xbcrypt > <file>
 
 
 # =================================================================================================================================
@@ -29,6 +34,11 @@ AWS_BINARY_PATH=$(which aws) || { echo -e "${RED}Error: AWS CLI is not installed
 # Set the S3 bucket and folder of this server before the first run (in the aws-dba-labs lab: terraform output backup_s3_prefix,
 # then binlog_backups). Binlogs go to <bucket>/<folder>/<server name>/<date>/:
 S3_BUCKET="s3://BUCKET/mysql/binlog_backups"
+# The AWS Secrets Manager secret with the encryption key (32 characters). Set the secret of this server before the first run
+# (the value below is the aws-dba-labs lab's secret). Without this key the binlog backups cannot be restored:
+ENCRYPTION_KEY_SECRET="mysql-single/backup-encryption-key"
+# Each binary log is encrypted into this folder before its upload, and the encrypted copy is deleted after it:
+ENCRYPTED_BINLOG_DIR="/backup/binlog_upload"
 SERVER_NAME=$(hostname -s)
 TEXTFILE_COLLECTOR_DIR="/var/lib/node_exporter/textfile_collector/"
 LOCK_FILE="/var/lock/mysql_binlog_backup.lock"
@@ -50,7 +60,7 @@ show_help(){
         "" "It uploads nothing itself: the next --continuous_binlog_backup run uploads <binary log> and every binary log after it." \
         "" "It refuses to run while a chain exists ($LAST_BINLOG_BACKUP_FILE): to start over, delete that file first." \
         "" "" \
-        "--continuous_binlog_backup" "Upload the closed binary logs of the chain to the S3 bucket and save backup monitoring metrics." \
+        "--continuous_binlog_backup" "Encrypt the closed binary logs of the chain, upload them to the S3 bucket and save backup monitoring metrics." \
         "" "Run it from cron every 15-30 minutes. It fails until a chain is started with --init_binlog_chain," \
         "" "and it stops with an error when a binary log is missing from the chain (a gap)." \
         "" "" \
@@ -65,7 +75,7 @@ show_help(){
         "New server, or one that never had binlog backups" "The oldest binary log on the server: the first row of SHOW BINARY LOGS." \
         "" "" \
         "Server that already has binlog backups" "The binary log after the last one in the bucket. To find the last one:" \
-        "(script reinstalled, tracking file lost)" "  aws s3 ls --recursive \"$S3_BUCKET/$SERVER_NAME/\" | awk -F/ '{print \$NF}' | sort | tail -n 1" \
+        "(script reinstalled, tracking file lost)" "  aws s3 ls --recursive \"$S3_BUCKET/$SERVER_NAME/\" | awk -F/ '{print \$NF}' | sed 's/\.xbcrypt\$//' | sort | tail -n 1" \
         "" "" \
         "After a gap in the chain" "Take a new full backup, then start from the binary log that backup starts from:" \
         "(binary logs purged before they were uploaded)" "  xtrabackup_binlog_info in the backup, or binlogFile in the @.json file of a MySQL Shell dump." \
@@ -158,6 +168,23 @@ fi
 # 10# reads the number as decimal (a leading zero would make bash read 000008 as an invalid octal number):
 LAST_BACKED_UP_NUMBER=$((10#${LAST_BACKED_UP_BINLOG##*.}))
 
+# Read the encryption key from AWS Secrets Manager, once per run. It stays in this script's memory only: xbcrypt takes it from its
+# environment (XBCRYPT_ENCRYPTION_KEY), so it is never on a command line (ps shows those to every user), on disk or in the log.
+# It is read before the FLUSH below, so a run without the key fails without rotating the binary log:
+ENCRYPTION_KEY=$($AWS_BINARY_PATH secretsmanager get-secret-value --secret-id "$ENCRYPTION_KEY_SECRET" --query SecretString --output text) || {
+    echo -e "${RED}Error: Unable to read the encryption key $ENCRYPTION_KEY_SECRET from AWS Secrets Manager.${RESET}"
+    return 1; }
+
+# AES256 needs a key of exactly 32 characters (xbcrypt would fail with an invalid key length):
+if [ ${#ENCRYPTION_KEY} -ne 32 ]; then
+    echo -e "${RED}Error: The encryption key $ENCRYPTION_KEY_SECRET has ${#ENCRYPTION_KEY} characters instead of 32.${RESET}"
+    return 1
+fi
+
+mkdir -p "$ENCRYPTED_BINLOG_DIR" || {
+    echo -e "${RED}Error: Unable to create the folder for the encrypted binary logs: $ENCRYPTED_BINLOG_DIR.${RESET}"
+    return 1; }
+
 # Get the list of binary log files: 
 BINLOG_LIST=$(mysql --login-path=local -B -N -e "SHOW BINARY LOGS;" | awk '{print $1}') || {
     echo -e "${RED}Error: Unable to retrieve the list of binary log files from MySQL.${RESET}"; 
@@ -189,13 +216,25 @@ for BINLOG_FILE in $BINLOG_LIST; do
         fi
 
         echo -e "${YELLOW}----Backing up binary log file: $BINLOG_FILE----${RESET}"
-        
-        # Copy the binary log file to the S3 bucket.
+
+        # Encrypt the binary log (AES256) into the upload folder. Only this xbcrypt command gets the key, in its environment:
+        ENCRYPTED_BINLOG="$ENCRYPTED_BINLOG_DIR/$BINLOG_FILE.xbcrypt"
+        XBCRYPT_ENCRYPTION_KEY="$ENCRYPTION_KEY" xbcrypt --encrypt-algo=AES256 < "$DATA_DIR/$BINLOG_FILE" > "$ENCRYPTED_BINLOG"
+        BINLOG_ENCRYPTION_STATUS=$?
+
+        # Check if the binary log file was encrypted successfully:
+        if [ $BINLOG_ENCRYPTION_STATUS -ne 0 ]; then
+            echo -e "${RED}Error encrypting binary log file: $BINLOG_FILE${RESET}"
+            rm -f "$ENCRYPTED_BINLOG"
+            return 1 # Failure
+        fi
+
+        # Copy the encrypted binary log file to the S3 bucket.
         # --if-none-match '*' makes the upload fail if an object with this name already exists, so a binlog with the
         # same name from another binlog sequence (restore, reset, rebuild) is never silently skipped or overwritten.
         # aws s3 cp has no such option, so s3api put-object does the upload: one request, up to 5 GB (max_binlog_size is at most 1 GB).
         # One folder per server, so the binary logs of different servers (failover, rebuilt server, cloned VM) never mix:
-        BINLOG_DESTINATION="$S3_BUCKET/$SERVER_NAME/$(date +%Y-%m-%d)/$BINLOG_FILE"
+        BINLOG_DESTINATION="$S3_BUCKET/$SERVER_NAME/$(date +%Y-%m-%d)/$BINLOG_FILE.xbcrypt"
         # put-object takes the bucket and the key separately: s3://<bucket>/<key>
         BINLOG_DESTINATION_PATH="${BINLOG_DESTINATION#s3://}"
         # timeout stops an upload that hangs (network stall, stuck login), so this run fails and the next one retries, instead of the hung
@@ -203,8 +242,11 @@ for BINLOG_FILE in $BINLOG_LIST; do
         # 9>&- keeps the lock out of aws and its worker processes: uutils timeout (Ubuntu 25.10+) kills only aws itself, and a
         # surviving worker that still held the lock would make every later run skip:
         timeout --kill-after=1m "$UPLOAD_TIMEOUT" $AWS_BINARY_PATH s3api put-object --if-none-match '*' \
-            --bucket "${BINLOG_DESTINATION_PATH%%/*}" --key "${BINLOG_DESTINATION_PATH#*/}" --body "$DATA_DIR/$BINLOG_FILE" 9>&-
+            --bucket "${BINLOG_DESTINATION_PATH%%/*}" --key "${BINLOG_DESTINATION_PATH#*/}" --body "$ENCRYPTED_BINLOG" 9>&-
         BINLOG_TRANSFER_STATUS=$?
+
+        # The encrypted copy is no longer needed (after a failed upload, the next run encrypts the binary log again):
+        rm -f "$ENCRYPTED_BINLOG"
 
         # Check if the binary log file was copied successfully:
         if [ $BINLOG_TRANSFER_STATUS -ne 0 ]; then

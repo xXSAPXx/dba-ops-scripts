@@ -2,6 +2,9 @@
 
 set -uo pipefail
 
+# No core dumps: a crashing xtrabackup would write its memory, and the encryption key in it, to disk (systemd-coredump):
+ulimit -c 0
+
 # Main script for exporting LOGICAL and PHYSICAL production DB backups. (Version 3, AWS)
 # The AWS version of mysql_backup_v3.sh: the same backup logic, with the upload to Amazon S3 instead of a GCP bucket.
 # 1) Uses Percona (MySQL Shell) or Percona (XtraBackup) to make a full instance backup.
@@ -13,6 +16,9 @@ set -uo pipefail
 # 7) Logs every backup run (normal execution and errors, with colors) to /var/log/mysql_backup.log. Rotation: mysql_backup.logrotate.example.
 #    The script logs itself, so cron's copy of the output goes to /dev/null, e.g. in /etc/cron.d/mysql_backup:
 #    0 2 * * * root /opt/scripts/mysql_backup_v3_aws.sh --xtrabackup > /dev/null 2>&1
+# 8) Encrypts the XtraBackup backups (AES256) with a key read from AWS Secrets Manager. The key is kept on the RAM disk (/dev/shm)
+#    for the backup only, and never printed. To restore: xbstream -x < <backup>.xbstream, then
+#    xtrabackup --decrypt=AES256 --encrypt-key-file=<file with the key> --decompress --remove-original --target-dir=<dir>, then --prepare.
 
 
 # Colors for output:
@@ -32,6 +38,11 @@ BACKUP_DIR_SHELL="${BACKUP_DIR}/full-instance-backup-${CURRENT_TIME}-mysql-shell
 AWS_BINARY_PATH=$(which aws 2>/dev/null)
 # Set the S3 bucket and folder of this server before the first run (in the aws-dba-labs lab: terraform output backup_s3_prefix):
 S3_BUCKET="s3://BUCKET/mysql"
+# The AWS Secrets Manager secret with the encryption key (32 characters). Set the secret of this server before the first run
+# (the value below is the aws-dba-labs lab's secret). Without this key the backups cannot be restored:
+ENCRYPTION_KEY_SECRET="mysql-single/backup-encryption-key"
+# Set by fetch_encryption_key for the duration of the backup:
+ENCRYPTION_KEY_FILE=""
 TEXTFILE_COLLECTOR_DIR="/var/lib/node_exporter/textfile_collector/"
 LOCK_FILE="/var/lock/mysql_backup.lock"
 LOG_FILE="/var/log/mysql_backup.log"
@@ -46,9 +57,9 @@ show_help() {
     echo
     echo -e "${GREEN}Available Backup Options:${RESET} 🔧"
     echo
-    echo -e "  ${CYAN}--xtrabackup${RESET}           | Backup the DB instance using Percona XtraBackup and transfer to the S3 bucket."
+    echo -e "  ${CYAN}--xtrabackup${RESET}           | Backup the DB instance using Percona XtraBackup (encrypted) and transfer to the S3 bucket."
     echo -e "  ${CYAN}--mysql_shell${RESET}          | Backup the DB instance using Percona MySQL Shell and transfer to the S3 bucket."
-    echo -e "  ${CYAN}--xtrabackup_local${RESET}     | Perform a local backup using Percona XtraBackup."
+    echo -e "  ${CYAN}--xtrabackup_local${RESET}     | Perform a local backup using Percona XtraBackup (encrypted)."
     echo -e "  ${CYAN}--mysql_shell_local${RESET}    | Perform a local backup using Percona MySQL Shell."
     echo -e "  ${CYAN}--help${RESET}                 | Display this help message."
     echo
@@ -130,8 +141,9 @@ acquire_backup_lock(){
         return 1
     fi
 
-    # Setup Trap for safety | If the script exits / is interrupted / or is killed, close the session to release the lock:
-    trap 'release_backup_lock; echo -e "${RED}-- Lock released by trap. --${RESET}"' EXIT INT TERM
+    # Setup Trap for safety | If the script exits / is interrupted / or is killed, close the session to release the lock,
+    # and remove the encryption key from the RAM disk:
+    trap 'remove_encryption_key; release_backup_lock; echo -e "${RED}-- Lock released by trap. --${RESET}"' EXIT INT TERM
 
     echo -e "${GREEN}-- Lock acquired successfully. --${RESET}"
 }
@@ -140,6 +152,44 @@ acquire_backup_lock(){
 # Function to release the MySQL named lock: closing fd 3 ends the lock session, and MySQL releases the lock with it (safe to call twice):
 release_backup_lock(){
     exec 3>&-
+}
+
+
+
+# Function to read the encryption key from AWS Secrets Manager into a file on the RAM disk (/dev/shm), for this backup only.
+# xtrabackup reads the key only from a file (--encrypt-key-file): on the RAM disk it never reaches a disk, and mktemp makes the file
+# readable by root only. The key never goes on a command line (ps shows those to every user) and is never printed, so it stays out of the log:
+fetch_encryption_key(){
+    if [ -z "$AWS_BINARY_PATH" ]; then
+        echo -e "${RED}Error: AWS CLI is not installed or not in PATH: the encryption key cannot be read from AWS Secrets Manager.${RESET}"
+        return 1
+    fi
+
+    local ENCRYPTION_KEY
+    ENCRYPTION_KEY=$(${AWS_BINARY_PATH} secretsmanager get-secret-value --secret-id "$ENCRYPTION_KEY_SECRET" --query SecretString --output text) || {
+        echo -e "${RED}Error: Unable to read the encryption key $ENCRYPTION_KEY_SECRET from AWS Secrets Manager.${RESET}"
+        return 1; }
+
+    # AES256 needs a key of exactly 32 characters (xtrabackup would fail with an invalid key length):
+    if [ ${#ENCRYPTION_KEY} -ne 32 ]; then
+        echo -e "${RED}Error: The encryption key $ENCRYPTION_KEY_SECRET has ${#ENCRYPTION_KEY} characters instead of 32.${RESET}"
+        return 1
+    fi
+
+    ENCRYPTION_KEY_FILE=$(mktemp -p /dev/shm mysql_backup_key.XXXXXX) || {
+        echo -e "${RED}Error: Unable to create the encryption key file on the RAM disk /dev/shm.${RESET}"
+        return 1; }
+
+    # printf is built into bash: the key is written to the file without ever being on a command line:
+    printf '%s' "$ENCRYPTION_KEY" > "$ENCRYPTION_KEY_FILE"
+    echo -e "${GREEN}-- Encryption key read from AWS Secrets Manager ($ENCRYPTION_KEY_SECRET). --${RESET}"
+}
+
+
+# Function to remove the encryption key file from the RAM disk (safe to call twice, and when there is no key file):
+remove_encryption_key(){
+    [ -n "$ENCRYPTION_KEY_FILE" ] && rm -f "$ENCRYPTION_KEY_FILE"
+    ENCRYPTION_KEY_FILE=""
 }
 
 
@@ -215,13 +265,24 @@ xtrabackup_backup() {
         # Go to BACKUP_DIR:
         cd ${BACKUP_DIR} || { echo -e "${RED}Error: Failed to change directory to ${BACKUP_DIR} ${RESET}"; return 1; }
 
-        # Run XtraBackup and check for failure
+        # Read the encryption key for this backup (the lock's trap removes it if the script is stopped):
+        fetch_encryption_key || {
+            release_backup_lock && \
+            trap - EXIT INT TERM && \
+            echo -e "${YELLOW}-- Lock named ${BACKUP_LOCK_NAME} has been released and trap removed. --${RESET}"
+            return 1; }
+
+        # Run XtraBackup and check for failure. Every file is compressed, then encrypted (AES256) with the key file on the RAM disk:
         xtrabackup --backup --datadir="${DATA_DIR}" --stream=xbstream --throttle=60 --parallel=8 --compress \
-            --compress-zstd-level=1 --compress-threads=8 --login-path=local \
+            --compress-zstd-level=1 --compress-threads=8 --encrypt=AES256 --encrypt-key-file="${ENCRYPTION_KEY_FILE}" \
+            --encrypt-threads=8 --login-path=local \
             > "${BACKUP_DIR}/${CURRENT_TIME}-dbfull.xbstream"
 
         # Save Backup Exit Code:
         XTRABACKUP_EXIT_CODE=$?
+
+        # The backup no longer needs the key: remove it from the RAM disk.
+        remove_encryption_key
 
         # Release the lock (closing the input of the lock session ends it) and clear the trap:
         release_backup_lock && \
