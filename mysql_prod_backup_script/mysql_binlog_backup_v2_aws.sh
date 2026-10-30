@@ -15,11 +15,6 @@ ulimit -c 0
 # <binary log>.xbcrypt files. To decrypt one: XBCRYPT_ENCRYPTION_KEY=<key> xbcrypt --decrypt --encrypt-algo=AES256 < <file>.xbcrypt > <file>
 
 
-# =================================================================================================================================
-# Maybe add a active binlog metric / last backed up binlog metric to the node exporter textfile_collector.
-# =================================================================================================================================
-
-
 # Colors for output:
 WHITE="\e[1m"
 GREEN="\e[32m"

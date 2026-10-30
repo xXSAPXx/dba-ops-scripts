@@ -8,11 +8,6 @@ set -uo pipefail
 # It logs every run (normal execution and errors, with colors) to /var/log/mysql_binlog_backup.log. Rotation: mysql_binlog_backup.logrotate.example.
 
 
-# =================================================================================================================================
-# Maybe add a active binlog metric / last backed up binlog metric to the node exporter textfile_collector.
-# =================================================================================================================================
-
-
 # Colors for output:
 WHITE="\e[1m"
 GREEN="\e[32m"
