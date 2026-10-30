@@ -24,7 +24,8 @@ YELLOW="\e[33m"
 RESET="\e[0m"
 
 DATA_DIR="/var/lib/mysql"
-LAST_BINLOG_BACKUP_FILE="/opt/last_binlog_backup.txt"
+# The tracking file of the binlog chain: the last binary log uploaded to the bucket. Delete it only to start a new chain (see --help):
+LAST_BINLOG_BACKUP_FILE="/opt/scripts/mysql_binlog_backup.state"
 AWS_BINARY_PATH=$(which aws) || { echo -e "${RED}Error: AWS CLI is not installed or not in PATH. Please install the AWS CLI v2.${RESET}"; }
 # Set the S3 bucket and folder of this server before the first run (in the aws-dba-labs lab: terraform output backup_s3_prefix,
 # then binlog_backups). Binlogs go to <bucket>/<folder>/<server name>/<date>/:
