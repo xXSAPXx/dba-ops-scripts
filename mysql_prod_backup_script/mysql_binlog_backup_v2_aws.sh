@@ -1,5 +1,32 @@
 #!/bin/env bash
 
+# =================================================================================================================================
+# BEFORE THE FIRST RUN ON A SERVER: what to set up and what to decide (details in the notes and at the variables below).
+#
+# Set up:
+#  - S3_BUCKET: the bucket and folder of this server's binlogs.
+#  - ENCRYPTION_KEY_SECRET: the AWS Secrets Manager secret with the 32-character key, best the same as the full backups'. Keep the
+#    secret for as long as any binlog encrypted with it: without the key those binlogs cannot be restored.
+#  - DATA_DIR: the folder of the binary logs (the folder of log_bin_basename), when it is not the datadir.
+#  - The server's IAM role: s3:PutObject and s3:ListBucket on the bucket folder (s3:GetObject to restore), secretsmanager:GetSecretValue
+#    on the secret.
+#  - Installed: the AWS CLI v2, and xbcrypt (part of Percona XtraBackup).
+#  - MySQL login for a user that may run SHOW BINARY LOGS and FLUSH BINARY LOGS: mysql_config_editor set --login-path=local, or /root/.my.cnf.
+#  - ENCRYPTED_BINLOG_DIR (/backup/binlog_upload): room for one encrypted binary log (max_binlog_size).
+#  - /opt/scripts: the scripts, and the binlog chain's tracking file (LAST_BINLOG_BACKUP_FILE).
+#  - node_exporter reads TEXTFILE_COLLECTOR_DIR (--collector.textfile.directory), for the binlog backup metrics.
+#  - The log rotation: cp mysql_binlog_backup.logrotate.example /etc/logrotate.d/mysql_binlog_backup
+#  - The chain, started once by hand: --init_binlog_chain <binary log> (--help shows which one), then the cron entry for
+#    --continuous_binlog_backup.
+#
+# Decide:
+#  - How often cron runs it (15-30 minutes): the binlogs of that time, and the active one, are not in the bucket yet.
+#  - binlog_expire_logs_seconds on the server: longer than the backups could ever stop, or binlogs are purged before their upload (a gap).
+#  - The retention: as long as the full backups, N + 4 days (see mysql_backup_v3_aws.sh).
+#  - The alerts: node_mysql_binlog_backup_status, the age of the last binlog backup, and the active binlog minus the last backed up one.
+#  - UPLOAD_TIMEOUT: well above the slowest upload of one binary log.
+# =================================================================================================================================
+
 set -uo pipefail
 
 # No core dumps: a crashing xbcrypt would write its memory, and the encryption key in it, to disk (systemd-coredump):

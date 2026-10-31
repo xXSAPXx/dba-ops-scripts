@@ -1,5 +1,29 @@
 #!/bin/bash
 
+# =================================================================================================================================
+# BEFORE THE FIRST RUN ON A SERVER: what to set up and what to decide (details in the numbered notes and at the variables below).
+#
+# Set up:
+#  - S3_BUCKET: the bucket and folder of this server's backups.
+#  - ENCRYPTION_KEY_SECRET: the AWS Secrets Manager secret with the 32-character key. Keep the secret for as long as any backup
+#    encrypted with it: without the key those backups cannot be restored.
+#  - The server's IAM role: s3:PutObject, s3:GetObject and s3:ListBucket on the bucket folder, secretsmanager:GetSecretValue on the secret.
+#  - Installed: Percona XtraBackup (8.4 for MySQL 8.4), the AWS CLI v2, and MySQL Shell for --mysql_shell.
+#  - MySQL login for a user with XtraBackup's privileges: mysql_config_editor set --login-path=local, or /root/.my.cnf.
+#  - BACKUP_DIR (/backup): a disk with room for one full backup and one incremental backup (compressed).
+#  - /opt/scripts: the scripts, and the incremental backup chain's state folder (LSN_DIR).
+#  - node_exporter reads TEXTFILE_COLLECTOR_DIR (--collector.textfile.directory), for the backup metrics.
+#  - The log rotation: cp mysql_backup.logrotate.example /etc/logrotate.d/mysql_backup
+#  - The cron entries in /etc/cron.d/mysql_backup (example in 7).
+#
+# Decide:
+#  - The schedule: how often a full backup, with incremental backups on the other days (example in 7: fulls on Monday and Thursday).
+#  - The retention: N days of restore points need a bucket lifecycle rule of N + 4 days, for these backups and the binlogs (see 9).
+#  - The alerts: node_mysql_backup_* (with two fulls a week, the full backup's age reaches 4 days) and node_mysql_incremental_backup_*.
+#  - UPLOAD_TIMEOUT: well above the slowest normal upload.
+#  - XtraBackup's load on the server: --throttle, --parallel and --compress-zstd-level in the xtrabackup commands.
+# =================================================================================================================================
+
 set -uo pipefail
 
 # No core dumps: a crashing xtrabackup would write its memory, and the encryption key in it, to disk (systemd-coredump):
