@@ -13,7 +13,8 @@ ulimit -c 0
 # 4) Transfers the backup to an S3 bucket, with a time limit (UPLOAD_TIMEOUT). The AWS CLI takes its credentials from the server's IAM role.
 # 5) Updates node_exporter text collector files for Grafana backup monitoring in case of SUCCESS or FAILURE.
 # 6) Backups can be performed LOCALLY by both utilities if needed.
-# 7) Logs every backup run (normal execution and errors, with colors) to /var/log/mysql_backup.log. Rotation: mysql_backup.logrotate.example.
+# 7) Logs every backup run (normal execution and errors, with colors) to /var/log/mysql_backup.log. Before the script runs from cron,
+#    install its rotation: cp mysql_backup.logrotate.example /etc/logrotate.d/mysql_backup (the log grows without it).
 #    The script logs itself, so cron's copy of the output goes to /dev/null, e.g. in /etc/cron.d/mysql_backup (full backups on Monday
 #    and Thursday, incremental backups on the other days):
 #    0 2 * * 1,4 root /opt/scripts/mysql_backup_v3_aws.sh --xtrabackup > /dev/null 2>&1
