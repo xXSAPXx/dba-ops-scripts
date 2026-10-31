@@ -14,11 +14,17 @@ ulimit -c 0
 # 5) Updates node_exporter text collector files for Grafana backup monitoring in case of SUCCESS or FAILURE.
 # 6) Backups can be performed LOCALLY by both utilities if needed.
 # 7) Logs every backup run (normal execution and errors, with colors) to /var/log/mysql_backup.log. Rotation: mysql_backup.logrotate.example.
-#    The script logs itself, so cron's copy of the output goes to /dev/null, e.g. in /etc/cron.d/mysql_backup:
-#    0 2 * * * root /opt/scripts/mysql_backup_v3_aws.sh --xtrabackup > /dev/null 2>&1
+#    The script logs itself, so cron's copy of the output goes to /dev/null, e.g. in /etc/cron.d/mysql_backup (full backups on Monday
+#    and Thursday, incremental backups on the other days):
+#    0 2 * * 1,4 root /opt/scripts/mysql_backup_v3_aws.sh --xtrabackup > /dev/null 2>&1
+#    0 2 * * 0,2,3,5,6 root /opt/scripts/mysql_backup_v3_aws.sh --xtrabackup_incremental > /dev/null 2>&1
 # 8) Encrypts the XtraBackup backups (AES256) with a key read from AWS Secrets Manager. The key is kept on the RAM disk (/dev/shm)
 #    for the backup only, and never printed. To restore: xbstream -x < <backup>.xbstream, then
 #    xtrabackup --decrypt=AES256 --encrypt-key-file=<file with the key> --decompress --remove-original --target-dir=<dir>, then --prepare.
+# 9) Incremental XtraBackup backups in a chain (--xtrabackup_incremental): each one holds only the pages changed since the backup before it
+#    (the full backup, or the incremental before it). A full backup (--xtrabackup) starts a new chain. To restore: decrypt every backup
+#    of the chain as in 8), then xtrabackup --prepare --apply-log-only --target-dir=<full>, then for each incremental in order
+#    xtrabackup --prepare --apply-log-only --target-dir=<full> --incremental-dir=<incremental> (the last one without --apply-log-only).
 
 
 # Colors for output:
@@ -34,6 +40,13 @@ CURRENT_TIME=`date +%Y-%m-%d-%H%M%S`
 DATA_DIR="/var/lib/mysql"
 BACKUP_DIR="/backup"
 BACKUP_DIR_SHELL="${BACKUP_DIR}/full-instance-backup-${CURRENT_TIME}-mysql-shell/"
+# The file of this run's XtraBackup backup (--xtrabackup_incremental changes it to <time>-dbincr.xbstream):
+XTRABACKUP_FILE="${CURRENT_TIME}-dbfull.xbstream"
+# The state of the incremental backup chain: xtrabackup_checkpoints (the LSN) of the last backup uploaded to the bucket, the base of the
+# next --xtrabackup_incremental. Delete it only to stop the chain: --xtrabackup_incremental then fails until a full backup (--xtrabackup) runs:
+LSN_DIR="/opt/scripts/mysql_backup.state"
+# Each XtraBackup run writes its own LSN folder here, and it replaces LSN_DIR only after the backup is in the bucket:
+NEW_LSN_DIR="/opt/scripts/mysql_backup.state.new"
 # Empty if the AWS CLI is not installed: main reports it once the log has started.
 AWS_BINARY_PATH=$(which aws 2>/dev/null)
 # Set the S3 bucket and folder of this server before the first run (in the aws-dba-labs lab: terraform output backup_s3_prefix):
@@ -44,6 +57,9 @@ ENCRYPTION_KEY_SECRET="mysql-single/backup-encryption-key"
 # Set by fetch_encryption_key for the duration of the backup:
 ENCRYPTION_KEY_FILE=""
 TEXTFILE_COLLECTOR_DIR="/var/lib/node_exporter/textfile_collector/"
+# The name in the metrics and their files: backup for full backups, incremental_backup for --xtrabackup_incremental (set in main),
+# so each has its own status, durations and age, e.g. node_mysql_incremental_backup_status in mysql_incremental_backup_status.prom:
+METRICS_NAME="backup"
 LOCK_FILE="/var/lock/mysql_backup.lock"
 LOG_FILE="/var/log/mysql_backup.log"
 # An upload that takes longer is stopped and the transfer fails. Keep it well above the slowest normal upload (node_mysql_backup_transfer_duration_seconds):
@@ -57,11 +73,14 @@ show_help() {
     echo
     echo -e "${GREEN}Available Backup Options:${RESET} 🔧"
     echo
-    echo -e "  ${CYAN}--xtrabackup${RESET}           | Backup the DB instance using Percona XtraBackup (encrypted) and transfer to the S3 bucket."
-    echo -e "  ${CYAN}--mysql_shell${RESET}          | Backup the DB instance using Percona MySQL Shell and transfer to the S3 bucket."
-    echo -e "  ${CYAN}--xtrabackup_local${RESET}     | Perform a local backup using Percona XtraBackup (encrypted)."
-    echo -e "  ${CYAN}--mysql_shell_local${RESET}    | Perform a local backup using Percona MySQL Shell."
-    echo -e "  ${CYAN}--help${RESET}                 | Display this help message."
+    echo -e "  ${CYAN}--xtrabackup${RESET}              | Backup the DB instance using Percona XtraBackup (encrypted) and transfer to the S3 bucket."
+    echo -e "                              | It starts a new chain for --xtrabackup_incremental."
+    echo -e "  ${CYAN}--xtrabackup_incremental${RESET}  | Incremental backup using Percona XtraBackup (encrypted): only the pages changed since the last backup"
+    echo -e "                              | of the chain, transferred to the S3 bucket. It fails until a full backup (--xtrabackup) starts a chain."
+    echo -e "  ${CYAN}--mysql_shell${RESET}             | Backup the DB instance using Percona MySQL Shell and transfer to the S3 bucket."
+    echo -e "  ${CYAN}--xtrabackup_local${RESET}        | Perform a local backup using Percona XtraBackup (encrypted)."
+    echo -e "  ${CYAN}--mysql_shell_local${RESET}       | Perform a local backup using Percona MySQL Shell."
+    echo -e "  ${CYAN}--help${RESET}                    | Display this help message."
     echo
     echo -e "  Every backup run is logged to $LOG_FILE (with colors: less -R $LOG_FILE)."
     echo
@@ -272,11 +291,13 @@ xtrabackup_backup() {
             echo -e "${YELLOW}-- Lock named ${BACKUP_LOCK_NAME} has been released and trap removed. --${RESET}"
             return 1; }
 
-        # Run XtraBackup and check for failure. Every file is compressed, then encrypted (AES256) with the key file on the RAM disk:
+        # Run XtraBackup and check for failure. Every file is compressed, then encrypted (AES256) with the key file on the RAM disk.
+        # --extra-lsndir also writes xtrabackup_checkpoints (the LSN) to NEW_LSN_DIR: once uploaded, this backup starts a new chain:
+        rm -rf "${NEW_LSN_DIR}"
         xtrabackup --backup --datadir="${DATA_DIR}" --stream=xbstream --throttle=60 --parallel=8 --compress \
             --compress-zstd-level=1 --compress-threads=8 --encrypt=AES256 --encrypt-key-file="${ENCRYPTION_KEY_FILE}" \
-            --encrypt-threads=8 --login-path=local \
-            > "${BACKUP_DIR}/${CURRENT_TIME}-dbfull.xbstream"
+            --encrypt-threads=8 --extra-lsndir="${NEW_LSN_DIR}" --login-path=local \
+            > "${BACKUP_DIR}/${XTRABACKUP_FILE}"
 
         # Save Backup Exit Code:
         XTRABACKUP_EXIT_CODE=$?
@@ -291,6 +312,74 @@ xtrabackup_backup() {
 
         if [ $XTRABACKUP_EXIT_CODE -ne 0 ]; then
             echo -e "${RED}XtraBackup failed.${RESET}"
+            return 1
+        fi
+
+        # End time of the backup script.
+        END_BACKUP="$(date +%s)"
+
+        # Calculate backup duration:
+        DURATION_BACKUP="$(( ($END_BACKUP - $START_BACKUP) + 2 ))"
+        echo
+        echo -e "${YELLOW}Duration in Seconds:${RESET} $(($END_BACKUP - $START_BACKUP))"
+        return 0
+
+    else
+        echo -e "${RED}Percona XtraBackup is not installed.${RESET}"
+        return 1
+    fi
+}
+
+
+
+# Function for an incremental XtraBackup Backup in a chain: only the pages changed since the last backup in the bucket (LSN_DIR):
+xtrabackup_incremental_backup() {
+    if command -v xtrabackup >/dev/null 2>&1; then
+
+        # Without a base there is no chain to continue: a person takes a full backup (--xtrabackup), which starts a new chain:
+        if [ ! -f "${LSN_DIR}/xtrabackup_checkpoints" ]; then
+            echo -e "${RED}Error: No base for the incremental backup: ${LSN_DIR}/xtrabackup_checkpoints does not exist. Take a full backup first (--xtrabackup).${RESET}"
+            return 1
+        fi
+
+        XTRABACKUP_FILE="${CURRENT_TIME}-dbincr.xbstream"
+        acquire_backup_lock || return 1
+        echo -e "${YELLOW}Starting Incremental XtraBackup at ${CURRENT_TIME} from $(grep '^to_lsn' "${LSN_DIR}/xtrabackup_checkpoints") ${RESET}"
+
+        # Start time of the backup script:
+        START_BACKUP="$(date +%s)"
+
+        # Go to BACKUP_DIR:
+        cd ${BACKUP_DIR} || { echo -e "${RED}Error: Failed to change directory to ${BACKUP_DIR} ${RESET}"; return 1; }
+
+        # Read the encryption key for this backup (the lock's trap removes it if the script is stopped):
+        fetch_encryption_key || {
+            release_backup_lock && \
+            trap - EXIT INT TERM && \
+            echo -e "${YELLOW}-- Lock named ${BACKUP_LOCK_NAME} has been released and trap removed. --${RESET}"
+            return 1; }
+
+        # Run XtraBackup as for the full backup, plus --incremental-basedir: it copies only the pages changed after the LSN in LSN_DIR.
+        # --extra-lsndir writes this backup's LSN to NEW_LSN_DIR: once uploaded, it is the base of the next incremental:
+        rm -rf "${NEW_LSN_DIR}"
+        xtrabackup --backup --datadir="${DATA_DIR}" --stream=xbstream --throttle=60 --parallel=8 --compress \
+            --compress-zstd-level=1 --compress-threads=8 --encrypt=AES256 --encrypt-key-file="${ENCRYPTION_KEY_FILE}" \
+            --encrypt-threads=8 --incremental-basedir="${LSN_DIR}" --extra-lsndir="${NEW_LSN_DIR}" --login-path=local \
+            > "${BACKUP_DIR}/${XTRABACKUP_FILE}"
+
+        # Save Backup Exit Code:
+        XTRABACKUP_EXIT_CODE=$?
+
+        # The backup no longer needs the key: remove it from the RAM disk.
+        remove_encryption_key
+
+        # Release the lock (closing the input of the lock session ends it) and clear the trap:
+        release_backup_lock && \
+        trap - EXIT INT TERM && \
+        echo -e "${YELLOW}-- Lock named ${BACKUP_LOCK_NAME} has been released and trap removed. --${RESET}"
+
+        if [ $XTRABACKUP_EXIT_CODE -ne 0 ]; then
+            echo -e "${RED}Incremental XtraBackup failed.${RESET}"
             return 1
         fi
 
@@ -361,14 +450,14 @@ transfer_backup(){
 
 
     #################### INITIATE XTRABACKUP TRANSFER ####################
-    elif [ -f "${BACKUP_DIR}/${CURRENT_TIME}-dbfull.xbstream" ]; then
+    elif [ -f "${BACKUP_DIR}/${XTRABACKUP_FILE}" ]; then
 
         echo -e "${YELLOW}Initiating S3 Transfer For XtraBackup.${RESET}"
 
-        # Upload New Backup to the S3 bucket (time limit, 9>&- and --no-progress as for the MySQL Shell upload above):
+        # Upload New Backup (full or incremental) to the S3 bucket (time limit, 9>&- and --no-progress as for the MySQL Shell upload above):
         timeout --kill-after=1m "$UPLOAD_TIMEOUT" ${AWS_BINARY_PATH} s3 cp --no-progress \
-            ${BACKUP_DIR}/${CURRENT_TIME}-dbfull.xbstream  \
-            ${S3_BUCKET}/${CURRENT_TIME}-dbfull.xbstream 9>&-
+            ${BACKUP_DIR}/${XTRABACKUP_FILE}  \
+            ${S3_BUCKET}/${XTRABACKUP_FILE} 9>&-
 
 
         # Check Transfer Code:
@@ -399,48 +488,58 @@ transfer_backup(){
 }
 
 
+# Function to move the incremental backup chain forward once the backup is in the bucket: its LSN folder replaces LSN_DIR and is the base
+# of the next --xtrabackup_incremental. A failed backup or upload never gets here, so the chain stays on the last backup in the bucket:
+advance_backup_chain(){
+    rm -rf "${LSN_DIR}" && mv "${NEW_LSN_DIR}" "${LSN_DIR}" || {
+        echo -e "${RED}Error: Unable to move ${NEW_LSN_DIR} to ${LSN_DIR}: the next incremental backup has no base until a full backup runs.${RESET}"
+        return 1; }
+    echo -e "${GREEN}-- Backup chain moved forward: the next incremental starts from $(grep '^to_lsn' "${LSN_DIR}/xtrabackup_checkpoints"). --${RESET}"
+}
 
-# Function to save BACKUP monitoring metrics in case of SUCCESS:
+
+
+# Function to save BACKUP monitoring metrics in case of SUCCESS (METRICS_NAME: backup or incremental_backup):
 save_backup_metrics_success() {
     # Add Success Backup Stats to Node_Exporter file:
-    printf "node_mysql_backup_status{instance=\"$SERVER_NAME\"} 0\n" > "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
-    printf "node_mysql_backup_duration_seconds{instance=\"$SERVER_NAME\"} $DURATION_BACKUP\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
+    printf "node_mysql_${METRICS_NAME}_status{instance=\"$SERVER_NAME\"} 0\n" > "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom.$$"
+    printf "node_mysql_${METRICS_NAME}_duration_seconds{instance=\"$SERVER_NAME\"} $DURATION_BACKUP\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom.$$"
 
     # Rename the temporary file atomically.
     # This avoids the node exporter seeing half a file.
-    mv "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$" \
-       "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom"
+    mv "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom.$$" \
+       "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom"
 }
 
 
 # Function to save BACKUP monitoring metrics in case of FAILURE:
 save_backup_metrics_failure() {
-    printf "node_mysql_backup_status{instance=\"$SERVER_NAME\"} 1\n" > "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
-    printf "node_mysql_backup_duration_seconds{instance=\"$SERVER_NAME\"} 1\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
-    printf "node_mysql_backup_transfer_status{instance=\"$SERVER_NAME\"} 1\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
-    printf "node_mysql_backup_transfer_duration_seconds{instance=\"$SERVER_NAME\"} 1\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
+    printf "node_mysql_${METRICS_NAME}_status{instance=\"$SERVER_NAME\"} 1\n" > "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom.$$"
+    printf "node_mysql_${METRICS_NAME}_duration_seconds{instance=\"$SERVER_NAME\"} 1\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom.$$"
+    printf "node_mysql_${METRICS_NAME}_transfer_status{instance=\"$SERVER_NAME\"} 1\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom.$$"
+    printf "node_mysql_${METRICS_NAME}_transfer_duration_seconds{instance=\"$SERVER_NAME\"} 1\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom.$$"
 
     # Rename the temporary file atomically.
     # This avoids the node exporter seeing half a file.
-    mv "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$" \
-       "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom"
+    mv "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom.$$" \
+       "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom"
 }
 
 
 # Function to save TRANSFER monitoring metrics in case of SUCCESS: / Update Backup Age Timestamp(ms) in a separate prom. file
 save_transfer_metrics_success() {
     # Add Success Transfer Stats to Node_Exporter file:
-    printf "node_mysql_backup_transfer_status{instance=\"$SERVER_NAME\"} 0\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom"
-    printf "node_mysql_backup_transfer_duration_seconds{instance=\"$SERVER_NAME\"} $DURATION_TRANS\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom"
-    printf "node_mysql_last_successful_backup_date{instance=\"$SERVER_NAME\"} $BACKUP_TIMESTAMP\n" > "$TEXTFILE_COLLECTOR_DIR/mysql_backup_age.prom"
+    printf "node_mysql_${METRICS_NAME}_transfer_status{instance=\"$SERVER_NAME\"} 0\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom"
+    printf "node_mysql_${METRICS_NAME}_transfer_duration_seconds{instance=\"$SERVER_NAME\"} $DURATION_TRANS\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom"
+    printf "node_mysql_last_successful_${METRICS_NAME}_date{instance=\"$SERVER_NAME\"} $BACKUP_TIMESTAMP\n" > "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_age.prom"
 }
 
 
 # Function to save TRANSFER monitoring metrics in case of FAILURE:
 save_transfer_metrics_failure() {
     # Add Failure Transfer Stats to Node_Exporter file:
-    printf "node_mysql_backup_transfer_status{instance=\"$SERVER_NAME\"} 1\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom"
-    printf "node_mysql_backup_transfer_duration_seconds{instance=\"$SERVER_NAME\"} 1\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom"
+    printf "node_mysql_${METRICS_NAME}_transfer_status{instance=\"$SERVER_NAME\"} 1\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom"
+    printf "node_mysql_${METRICS_NAME}_transfer_duration_seconds{instance=\"$SERVER_NAME\"} 1\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom"
 }
 
 
@@ -459,7 +558,7 @@ function main() {
     # A run that finds the lock taken fails without touching the metrics: the backup that holds it still writes its own.
     # The log starts first, so these errors are logged too (--help and invalid options are not logged):
     case "$1" in
-        --mysql_shell|--xtrabackup|--mysql_shell_local|--xtrabackup_local)
+        --mysql_shell|--xtrabackup|--xtrabackup_incremental|--mysql_shell_local|--xtrabackup_local)
             start_log "$1"
 
             if [ -z "$AWS_BINARY_PATH" ] && [[ "$1" != *_local ]]; then
@@ -510,13 +609,39 @@ function main() {
                 exit 1
             fi
             manage_old_backups
-            transfer_backup
+            # Once the backup is in the bucket, it starts a new chain for --xtrabackup_incremental:
+            transfer_backup && advance_backup_chain
             if [ $? -eq 0 ]; then
                 save_transfer_metrics_success
                 echo -e "${GREEN}Saved Successful Transfer Metrics for XtraBackup.${RESET}"
             else
                 save_transfer_metrics_failure
                 echo -e "${RED}Saved Failed Transfer Metrics for XtraBackup!${RESET}"
+                exit 1
+            fi
+            ;;
+        --xtrabackup_incremental)
+            METRICS_NAME="incremental_backup"
+            xtrabackup_incremental_backup
+            if [ $? -eq 0 ]; then
+                save_backup_metrics_success
+                echo -e "${GREEN}Saved Success Metrics for Incremental XtraBackup Process.${RESET}"
+            else
+                save_backup_metrics_failure
+                echo -e "${RED}Saved Failure Metrics for Incremental XtraBackup Process!${RESET}"
+                exit 1
+            fi
+            manage_old_backups
+            # Once the backup is in the bucket, it is the base of the next incremental:
+            transfer_backup && advance_backup_chain
+            if [ $? -eq 0 ]; then
+                save_transfer_metrics_success
+                echo -e "${GREEN}Saved Successful Transfer Metrics for Incremental XtraBackup.${RESET}"
+                # The incremental backup is in the bucket, so it is not kept on the local disk (a failed upload keeps it until manage_old_backups):
+                rm -fv "${BACKUP_DIR}/${XTRABACKUP_FILE}"
+            else
+                save_transfer_metrics_failure
+                echo -e "${RED}Saved Failed Transfer Metrics for Incremental XtraBackup!${RESET}"
                 exit 1
             fi
             ;;
