@@ -14,6 +14,7 @@ ulimit -c 0
 # 4) Restores the incremental backups one at a time: extract, apply, delete. INCREMENTAL_DIR never holds more than one.
 # 5) Reads the encryption key from AWS Secrets Manager into a file on the RAM disk (/dev/shm), removed when the script ends.
 # 6) Logs the whole run to LOG_FILE, and ends with the total duration and what changed with the restore.
+# 7) Deletes the incremental backup chain of this server (BACKUP_CHAIN_STATE): the next incremental backup fails until a full backup runs.
 # WARNING: it stops MySQL and deletes everything in the datadir.
 
 # === Colors ===
@@ -36,6 +37,9 @@ DATA_DIR="/var/lib/mysql"
 INCREMENTAL_DIR="/backup/restore_incremental"
 # Memory for the prepare (xtrabackup's default is only 100M). MySQL is stopped, so most of the free RAM (production: 64GB, as in mysql_restore.sh):
 PREPARE_MEMORY="2G"
+# The incremental backup chain of mysql_backup_v3_aws.sh on this server. The restore deletes it: an incremental from the old chain
+# would succeed without an error but miss changes, so --xtrabackup_incremental fails instead until a full backup starts a new chain:
+BACKUP_CHAIN_STATE="/opt/scripts/mysql_backup.state"
 # Set to the key file on the RAM disk once the key is read:
 KEY_FILE=""
 
@@ -133,6 +137,9 @@ rm -rf "${DATA_DIR:?}"/*
 mkdir -p "$DATA_DIR"
 chown -R mysql:mysql "$DATA_DIR"
 echo -e "${YELLOW}Directory prepared at: $(date) ${RESET}"
+# The old data is gone, so the old incremental backup chain no longer matches this server, even if the restore fails later:
+rm -rf "$BACKUP_CHAIN_STATE"
+echo -e "${YELLOW}Incremental backup chain stopped (${BACKUP_CHAIN_STATE} deleted).${RESET}"
 echo
 
 # === Full backup: straight into the datadir ===
@@ -201,5 +208,5 @@ echo -e "${CYAN}Reminders after the restore:${RESET}"
 echo -e "  - New server_uuid: auto.cnf is not in the backup, so MySQL generated a new one: $(sed -n 's/^server-uuid=//p' "$DATA_DIR/auto.cnf" 2>/dev/null)"
 echo -e "  - New TLS certificates: the *.pem files are not in the backup and were generated again. Clients that verify the server need the new CA."
 echo -e "  - Binary log numbering starts again: the binlog backup chain needs a new full backup, then --init_binlog_chain (see its --help)."
-echo -e "  - The incremental backup chain of this server belongs to the old data: take a full backup (--xtrabackup) before the next --xtrabackup_incremental."
+echo -e "  - The incremental backup chain was stopped: --xtrabackup_incremental fails until a full backup (--xtrabackup) starts a new chain."
 echo -e "  - The restored data ends at this binary log position (a point-in-time recovery continues from here): $(tr '\t' ' ' < "$DATA_DIR/xtrabackup_binlog_info" 2>/dev/null)"
