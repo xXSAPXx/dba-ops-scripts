@@ -25,6 +25,8 @@ ulimit -c 0
 #    (the full backup, or the incremental before it). A full backup (--xtrabackup) starts a new chain. To restore: decrypt every backup
 #    of the chain as in 8), then xtrabackup --prepare --apply-log-only --target-dir=<full>, then for each incremental in order
 #    xtrabackup --prepare --apply-log-only --target-dir=<full> --incremental-dir=<incremental> (the last one without --apply-log-only).
+#    Bucket retention: to restore any moment of the last N days, keep every backup N + 4 days. A restore point can need a full backup
+#    up to 4 days older than itself (Thursday's full, then three incrementals and a day of binlogs).
 
 
 # Colors for output:

@@ -13,6 +13,8 @@ ulimit -c 0
 # It logs every run (normal execution and errors, with colors) to /var/log/mysql_binlog_backup.log. Rotation: mysql_binlog_backup.logrotate.example.
 # It encrypts every binary log (xbcrypt, AES256) before the upload, with a key read from AWS Secrets Manager: the bucket holds only
 # <binary log>.xbcrypt files. To decrypt one: XBCRYPT_ENCRYPTION_KEY=<key> xbcrypt --decrypt --encrypt-algo=AES256 < <file>.xbcrypt > <file>
+# Bucket retention: keep the binlogs as long as the full backups (N + 4 days, see mysql_backup_v3_aws.sh), so a restore can always replay
+# the binlogs from the full backup or any incremental after it.
 
 
 # Colors for output:
