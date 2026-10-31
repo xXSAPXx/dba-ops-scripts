@@ -1,4 +1,25 @@
 #!/bin/bash
+
+# =================================================================================================================================
+# BEFORE THE FIRST RUN ON A SERVER: what to set up and what to decide (details in the notes and at the variables below).
+#
+# Set up:
+#  - S3_BUCKET: the bucket and folder of the backups to restore.
+#  - ENCRYPTION_KEY_SECRET: the AWS Secrets Manager secret the backups were encrypted with.
+#  - The server's IAM role: s3:GetObject and s3:ListBucket on the bucket folder, secretsmanager:GetSecretValue on the secret.
+#  - Installed: Percona XtraBackup for the MySQL version of the backups (8.4 for MySQL 8.4), and the AWS CLI v2.
+#  - DATA_DIR: this server's datadir, on a disk with room for the whole database (decompressed). MySQL runs as the systemd service mysqld.
+#  - INCREMENTAL_DIR: a folder on a disk with room for one incremental backup (decompressed).
+#  - PREPARE_MEMORY: most of this server's free RAM (MySQL is stopped during the restore).
+#  - The relaylog, doublebuff, binlog and log folders the script creates in DATA_DIR: they must match this server's my.cnf.
+#  - Run it as root.
+#
+# Decide:
+#  - Which backups: the full backup, then its incremental backups up to the moment to restore (see the usage: aws s3 ls).
+#  - After the restore: a new full backup and a new binlog chain, and what clients and replicas need for the new server_uuid
+#    and TLS certificates (the reminders at the end of the run).
+# =================================================================================================================================
+
 # -E: the ERR trap set before mysqld is stopped also covers the functions (restore_backup):
 set -Eeuo pipefail
 
