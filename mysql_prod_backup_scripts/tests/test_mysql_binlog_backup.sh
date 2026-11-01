@@ -2,9 +2,9 @@
 
 # Tests mysql_binlog_backup_v2.sh against a mocked MySQL and gcloud. No MySQL server, bucket or root needed.
 #
-# Run on Linux (WSL works):         bash mysql_prod_backup_script/tests/test_mysql_binlog_backup.sh
+# Run on Linux (WSL works):         bash mysql_prod_backup_scripts/tests/test_mysql_binlog_backup.sh
 # With GNU timeout where the default timeout is uutils (Ubuntu 25.10+, as on WSL Ubuntu 26.04):
-#                                    TIMEOUT_BIN=gnutimeout bash mysql_prod_backup_script/tests/test_mysql_binlog_backup.sh
+#                                    TIMEOUT_BIN=gnutimeout bash mysql_prod_backup_scripts/tests/test_mysql_binlog_backup.sh
 #
 # The script is copied with its paths pointed at a temporary directory and a 2 s upload timeout.
 # Each case checks the exit code, the tracking file and the output, and the run ends with a PASS/FAIL count.
