@@ -8,7 +8,8 @@
 #  - ENCRYPTION_KEY_SECRET: the AWS Secrets Manager secret with the 32-character key. Keep the secret for as long as any backup
 #    encrypted with it: without the key those backups cannot be restored.
 #  - The server's IAM role: s3:PutObject, s3:GetObject and s3:ListBucket on the bucket folder, secretsmanager:GetSecretValue on the secret.
-#  - Installed: Percona XtraBackup (8.4 for MySQL 8.4), the AWS CLI v2, and MySQL Shell for --mysql_shell.
+#  - Installed: Percona XtraBackup (8.4 for MySQL 8.4), the AWS CLI v2, and MySQL Shell for --mysql_shell (which also needs xbcrypt,
+#    part of XtraBackup).
 #  - MySQL login for a user with XtraBackup's privileges: mysql_config_editor set --login-path=local, or /root/.my.cnf.
 #  - BACKUP_DIR (/backup): a disk with room for one full backup and one incremental backup (compressed).
 #  - /opt/scripts: the scripts, and the incremental backup chain's state folder (LSN_DIR).
@@ -22,11 +23,13 @@
 #  - The alerts: node_mysql_backup_* (with two fulls a week, the full backup's age reaches 4 days) and node_mysql_incremental_backup_*.
 #  - UPLOAD_TIMEOUT: well above the slowest normal upload.
 #  - XtraBackup's load on the server: --throttle, --parallel and --compress-zstd-level in the xtrabackup commands.
+#  - The MySQL Shell dump folder: only its archive is encrypted. The folder itself stays unencrypted in BACKUP_DIR for a day or two
+#    (manage_old_backups), for a fast local restore.
 # =================================================================================================================================
 
 set -uo pipefail
 
-# No core dumps: a crashing xtrabackup would write its memory, and the encryption key in it, to disk (systemd-coredump):
+# No core dumps: a crashing xtrabackup or xbcrypt would write its memory, and the encryption key in it, to disk (systemd-coredump):
 ulimit -c 0
 
 # Main script for exporting LOGICAL and PHYSICAL production DB backups. (Version 3, AWS)
@@ -43,9 +46,11 @@ ulimit -c 0
 #    and Thursday, incremental backups on the other days):
 #    0 2 * * 1,4 root /opt/scripts/mysql_backup_v3_aws.sh --xtrabackup > /dev/null 2>&1
 #    0 2 * * 0,2,3,5,6 root /opt/scripts/mysql_backup_v3_aws.sh --xtrabackup_incremental > /dev/null 2>&1
-# 8) Encrypts the XtraBackup backups (AES256) with a key read from AWS Secrets Manager. The key is kept on the RAM disk (/dev/shm)
-#    for the backup only, and never printed. To restore: xbstream -x < <backup>.xbstream, then
+# 8) Encrypts the XtraBackup backups and the MySQL Shell archives (AES256) with a key read from AWS Secrets Manager. The key is kept on the
+#    RAM disk (/dev/shm) for the backup only, and never printed. To restore: xbstream -x < <backup>.xbstream, then
 #    xtrabackup --decrypt=AES256 --encrypt-key-file=<file with the key> --decompress --remove-original --target-dir=<dir>, then --prepare.
+#    To restore a MySQL Shell archive: xbcrypt --decrypt --encrypt-algo=AES256 --encrypt-key-file=<file with the key> < <archive>.tar.xbcrypt | tar -xf -
+#    then util.loadDump on the folder (it reads the zstd files itself).
 # 9) Incremental XtraBackup backups in a chain (--xtrabackup_incremental): each one holds only the pages changed since the backup before it
 #    (the full backup, or the incremental before it). A full backup (--xtrabackup) starts a new chain. To restore: decrypt every backup
 #    of the chain as in 8), then xtrabackup --prepare --apply-log-only --target-dir=<full>, then for each incremental in order
@@ -104,9 +109,9 @@ show_help() {
     echo -e "                              | It starts a new chain for --xtrabackup_incremental."
     echo -e "  ${CYAN}--xtrabackup_incremental${RESET}  | Incremental backup using Percona XtraBackup (encrypted): only the pages changed since the last backup"
     echo -e "                              | of the chain, transferred to the S3 bucket. It fails until a full backup (--xtrabackup) starts a chain."
-    echo -e "  ${CYAN}--mysql_shell${RESET}             | Backup the DB instance using Percona MySQL Shell and transfer to the S3 bucket."
+    echo -e "  ${CYAN}--mysql_shell${RESET}             | Backup the DB instance using Percona MySQL Shell (encrypted archive) and transfer to the S3 bucket."
     echo -e "  ${CYAN}--xtrabackup_local${RESET}        | Perform a local backup using Percona XtraBackup (encrypted)."
-    echo -e "  ${CYAN}--mysql_shell_local${RESET}       | Perform a local backup using Percona MySQL Shell."
+    echo -e "  ${CYAN}--mysql_shell_local${RESET}       | Perform a local backup using Percona MySQL Shell (encrypted archive)."
     echo -e "  ${CYAN}--help${RESET}                    | Display this help message."
     echo
     echo -e "  Every backup run is logged to $LOG_FILE (with colors: less -R $LOG_FILE)."
@@ -245,11 +250,23 @@ mysql_shell_backup(){
 
     command -v mysqlsh >/dev/null 2>&1
     if [ $? -eq 0 ]; then
+        # Checked before the dump: without xbcrypt the run would fail only at the archive, hours later:
+        command -v xbcrypt >/dev/null 2>&1 || {
+            echo -e "${RED}xbcrypt (part of Percona XtraBackup) is not installed: the archive cannot be encrypted.${RESET}"
+            return 1; }
+
         acquire_backup_lock || return 1
         echo -e "${YELLOW}Starting MySQL Shell Backup at ${CURRENT_TIME} ${RESET}"
 
         # Start time of the backup script:
         START_BACKUP="$(date +%s)"
+
+        # Read the encryption key for the archive, also before the dump (the lock's trap removes it if the script is stopped):
+        fetch_encryption_key || {
+            release_backup_lock && \
+            trap - EXIT INT TERM && \
+            echo -e "${YELLOW}-- Lock named ${BACKUP_LOCK_NAME} has been released and trap removed. --${RESET}"
+            return 1; }
 
         # Perform a full instance backup with MySQL Shell: // Ensures consistency without locking!
         mysqlsh --login-path=local -S /var/lib/mysql/mysql.sock --js <<EOF
@@ -261,22 +278,31 @@ EOF
         # Save Backup Exit Code:
         MYSQL_SHELL_EXIT_CODE=$?
 
-        # Release the lock (closing the input of the lock session ends it) and clear the trap:
+        # Release the lock (closing the input of the lock session ends it): the archive does not need it.
+        # The trap stays until the key is removed:
         release_backup_lock && \
-        trap - EXIT INT TERM && \
-        echo -e "${YELLOW}-- Lock named ${BACKUP_LOCK_NAME} has been released and trap removed. --${RESET}"
+        echo -e "${YELLOW}-- Lock named ${BACKUP_LOCK_NAME} has been released. --${RESET}"
 
         if [ $MYSQL_SHELL_EXIT_CODE -ne 0 ]; then
+            remove_encryption_key
+            trap - EXIT INT TERM
             echo -e "${RED}MySQL Shell Backup Failed!${RESET}"
             return 1
         fi
 
         # Archive the MySQL Shell backup folder without compressing it again: the dump files are already compressed (zstd).
+        # xbcrypt encrypts it (AES256) as it is written, so an unencrypted archive never reaches the disk. With pipefail, a failure of tar or xbcrypt fails this step.
         # The relative name stores the folder as full-instance-backup-<time>-mysql-shell/ instead of under its full path:
-        cd ${BACKUP_DIR} && time tar -cf full-instance-backup-${CURRENT_TIME}.tar full-instance-backup-${CURRENT_TIME}-mysql-shell
+        cd ${BACKUP_DIR} && time tar -cf - full-instance-backup-${CURRENT_TIME}-mysql-shell | \
+            xbcrypt --encrypt-algo=AES256 --encrypt-key-file="${ENCRYPTION_KEY_FILE}" > full-instance-backup-${CURRENT_TIME}.tar.xbcrypt
 
         # Save Tar exit code:
         FOLDER_ARCHIVE_STATUS=$?
+
+        # The archive no longer needs the key: remove it from the RAM disk and clear the trap.
+        remove_encryption_key
+        trap - EXIT INT TERM
+
         if [ $FOLDER_ARCHIVE_STATUS -ne 0 ]; then
             echo -e "${RED}Backup Folder Archive Failed!${RESET}"
             return 1
@@ -427,7 +453,7 @@ xtrabackup_incremental_backup() {
 
 
 
-# Function to Delete old local backups (MySQL Shell archives: .tar, and .tar.gz from v2):
+# Function to Delete old local backups (MySQL Shell archives: .tar.xbcrypt, and .tar and .tar.gz from older versions):
 manage_old_backups() {
     time find ${BACKUP_DIR} -mindepth 1 -maxdepth 1 -type d  -name 'full-instance-backup*' -mtime +0 -exec rm -rfv {} \;
     time find ${BACKUP_DIR} -mindepth 1 -maxdepth 1 -type f  -name 'full-instance-backup*.tar*' -mtime +2 -exec rm -rfv {} \;
@@ -451,8 +477,8 @@ transfer_backup(){
         # --kill-after kills aws if it ignores the stop signal. 9>&- keeps the run lock (flock) out of aws and its worker processes,
         # so a worker that survives the timeout cannot block every later run. --no-progress: one line in the log, not a progress bar:
         timeout --kill-after=1m "$UPLOAD_TIMEOUT" ${AWS_BINARY_PATH} s3 cp --no-progress \
-            ${BACKUP_DIR}/full-instance-backup-${CURRENT_TIME}.tar \
-            ${S3_BUCKET}/full-instance-backup-${CURRENT_TIME}.tar 9>&-
+            ${BACKUP_DIR}/full-instance-backup-${CURRENT_TIME}.tar.xbcrypt \
+            ${S3_BUCKET}/full-instance-backup-${CURRENT_TIME}.tar.xbcrypt 9>&-
 
         # Check Transfer Code:
         TRANSFER_EXIT_CODE=$?

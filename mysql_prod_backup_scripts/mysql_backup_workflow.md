@@ -6,7 +6,7 @@ How [`mysql_backup_v3_aws.sh`](mysql_backup_v3_aws.sh) works. The diagrams leave
 |---|---|
 | `--xtrabackup` | A full backup with XtraBackup, compressed, encrypted and uploaded to the bucket. It starts a new incremental chain. |
 | `--xtrabackup_incremental` | Only the pages changed since the last backup of the chain, compressed, encrypted and uploaded. |
-| `--mysql_shell` | A logical dump with MySQL Shell, uploaded (not encrypted). |
+| `--mysql_shell` | A logical dump with MySQL Shell: its archive is encrypted and uploaded to the bucket. |
 | `--xtrabackup_local`, `--mysql_shell_local` | Only the backup step (diagram 2): the backup stays in `/backup`, with no upload and no metrics. |
 
 ## 1. One run
@@ -64,21 +64,30 @@ flowchart TD
     classDef ok fill:#dafbe1,stroke:#1a7f37,color:#1f2328
 ```
 
-If the script is stopped or killed during the backup, a trap deletes the key file and releases the lock. The key is never printed or written to the log.
-
-MySQL Shell:
+MySQL Shell. Each fail also goes back to diagram 1 as "failed":
 
 ```mermaid
 %%{init: {"flowchart": {"wrappingWidth": 400}}}%%
-flowchart LR
-    START(["--mysql_shell"]) --> LOCK["Take the MySQL named lock<br/>backup_running"]
-    LOCK --> DUMP["mysqlsh util.dumpInstance<br/>into /backup (zstd)"]
+flowchart TD
+    START(["--mysql_shell"]) --> LOCK["Take the MySQL named lock backup_running<br/>(the application's TRUNCATE scripts wait for it)"]
+    LOCK -->|"held by another session"| LFAIL["Fail"]:::fail
+    LOCK -->|"taken"| KEY["Read the encryption key from the secret store<br/>into a file on the RAM disk (/dev/shm)"]
+    KEY -->|"failed"| KFAIL["Release the lock, fail"]:::fail
+    KEY -->|"ok"| DUMP["mysqlsh util.dumpInstance<br/>into a folder in /backup (zstd)"]
     DUMP --> UNLOCK["Release the lock"]
-    UNLOCK --> TAR["tar the dump folder<br/>(no second compression)"]
-    TAR --> DONE(["Back to diagram 1"]):::ok
+    UNLOCK --> DUMPOK{"Dump ok?"}
+    DUMPOK -->|"no"| DFAIL["Delete the key file, fail"]:::fail
+    DUMPOK -->|"yes"| TAR["tar the folder, without compressing it again,<br/>encrypted (xbcrypt, AES256) as it is written:<br/>/backup/full-instance-backup-TIME.tar.xbcrypt"]
+    TAR --> RMKEY["Delete the key file"]
+    RMKEY --> TAROK{"Archive ok?"}
+    TAROK -->|"no"| AFAIL["Fail"]:::fail
+    TAROK -->|"yes"| DONE(["Back to diagram 1: metrics, upload"]):::ok
 
+    classDef fail fill:#ffebe9,stroke:#cf222e,color:#1f2328
     classDef ok fill:#dafbe1,stroke:#1a7f37,color:#1f2328
 ```
+
+If the script is interrupted during a backup, a trap deletes the key file and releases the lock. The key is never printed or written to the log.
 
 ## 3. The incremental chain
 
@@ -103,8 +112,8 @@ flowchart LR
 
 | Where | What |
 |---|---|
-| Bucket | `TIME-dbfull.xbstream` and `TIME-dbincr.xbstream` (encrypted), `full-instance-backup-TIME.tar` (MySQL Shell) |
-| `/backup` | Recent backups for a quick restore: XtraBackup files are deleted after 23 hours, MySQL Shell archives after 3 days. Incrementals are deleted right after their upload. |
+| Bucket | `TIME-dbfull.xbstream`, `TIME-dbincr.xbstream` and `full-instance-backup-TIME.tar.xbcrypt` (MySQL Shell), all encrypted |
+| `/backup` | Recent backups for a quick restore: XtraBackup files are deleted after 23 hours, MySQL Shell archives after 3 days, and the MySQL Shell dump folder (not encrypted) after a day or two. Incrementals are deleted right after their upload. |
 | `/opt/scripts/mysql_backup.state` | The chain state: the position of the last backup in the bucket |
 | `/var/log/mysql_backup.log` | Every run, with colors (`less -R`) |
 | node_exporter textfile folder | `node_mysql_backup_*` (full and MySQL Shell) and `node_mysql_incremental_backup_*`: status, durations, time of the last success |
