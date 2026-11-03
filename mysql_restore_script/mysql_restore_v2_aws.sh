@@ -10,12 +10,14 @@
 #  - Installed: Percona XtraBackup for the MySQL version of the backups (8.4 for MySQL 8.4), and the AWS CLI v2.
 #  - DATA_DIR: this server's datadir, on a disk with room for the whole database (decompressed). MySQL runs as the systemd service mysqld.
 #  - INCREMENTAL_DIR: a folder on a disk with room for one incremental backup (decompressed).
+#  - SHELL_RESTORE_DIR: a folder on a disk with room for one MySQL Shell dump, to fetch MySQL Shell archives.
 #  - PREPARE_MEMORY: most of this server's free RAM (MySQL is stopped during the restore).
 #  - The relaylog, doublebuff, binlog and log folders the script creates in DATA_DIR: they must match this server's my.cnf.
 #  - Run it as root.
 #
 # Decide:
 #  - Which backups: the full backup, then its incremental backups up to the moment to restore (see the usage: aws s3 ls).
+#  - Or a MySQL Shell archive: what to load from it once it is fetched (the whole instance, one database, one table).
 #  - After the restore: a new full backup and a new binlog chain, and what clients and replicas need for the new server_uuid
 #    and TLS certificates (the reminders at the end of the run).
 # =================================================================================================================================
@@ -36,7 +38,9 @@ ulimit -c 0
 # 5) Reads the encryption key from AWS Secrets Manager into a file on the RAM disk (/dev/shm), removed when the script ends.
 # 6) Logs the whole run to LOG_FILE, and ends with the total duration and what changed with the restore.
 # 7) Deletes the incremental backup chain of this server (BACKUP_CHAIN_STATE): the next incremental backup fails until a full backup runs.
-# WARNING: it stops MySQL and deletes everything in the datadir.
+# 8) A MySQL Shell archive (full-instance-backup-<time>.tar.xbcrypt) is only fetched: streamed from the bucket, decrypted and unpacked into
+#    SHELL_RESTORE_DIR with one command. MySQL is not touched: a DBA then loads what is needed with util.loadDump (the script prints how).
+# WARNING: an XtraBackup restore stops MySQL and deletes everything in the datadir.
 
 # === Colors ===
 GREEN="\e[32m"
@@ -56,6 +60,9 @@ ENCRYPTION_KEY_SECRET="mysql-single/backup-encryption-key"
 DATA_DIR="/var/lib/mysql"
 # Each incremental backup is extracted here, applied to DATA_DIR, and deleted before the next one:
 INCREMENTAL_DIR="/backup/restore_incremental"
+# A MySQL Shell archive is unpacked into a folder here. Not directly in /backup: the backup script's cleanup deletes full-instance-backup*
+# folders there that are over a day old, and tar restores the folder's old date, so the next backup run would delete it:
+SHELL_RESTORE_DIR="/backup/restore_shell"
 # Memory for the prepare (xtrabackup's default is only 100M). MySQL is stopped, so most of the free RAM (production: 64GB, as in mysql_restore.sh):
 PREPARE_MEMORY="2G"
 # The incremental backup chain of mysql_backup_v3_aws.sh on this server. The restore deletes it: an incremental from the old chain
@@ -67,10 +74,13 @@ KEY_FILE=""
 # === Backup arguments: the full backup, then its incremental backups in order (names as aws s3 ls shows them) ===
 FULL_BACKUP="${1:-}"
 INCREMENTAL_BACKUPS=("${@:2}")
+# The file name decides the path: for a MySQL Shell archive, this is the folder it unpacks to (empty for an XtraBackup restore):
+DUMP_FOLDER=""
+[[ "$FULL_BACKUP" == full-instance-backup-*.tar.xbcrypt ]] && DUMP_FOLDER="$SHELL_RESTORE_DIR/${FULL_BACKUP%.tar.xbcrypt}-mysql-shell"
 
 if [ -z "$FULL_BACKUP" ]; then
     echo
-    echo -e "${RED}╰┈➤ Error: Missing Xtrabackup backup argument.${RESET}"
+    echo -e "${RED}╰┈➤ Error: Missing backup argument.${RESET}"
     echo "======================================================================================================================"
     echo
     echo -e " ${CYAN}--Example Usage:${RESET}         | $0 2026-10-31-130108-dbfull.xbstream"
@@ -79,7 +89,10 @@ if [ -z "$FULL_BACKUP" ]; then
     echo -e "                          |     2026-10-31-131934-dbincr.xbstream 2026-10-31-132156-dbincr.xbstream"
     echo -e "                          | The full backup first, then its incremental backups in order, up to the one to restore."
     echo
-    echo -e " ${CYAN}--Check Latest Backups:${RESET}  | aws s3 ls $S3_BUCKET/ --human-readable | grep xbstream"
+    echo -e " ${CYAN}--MySQL Shell Archive:${RESET}   | $0 full-instance-backup-2026-10-31-130108.tar.xbcrypt"
+    echo -e "                          | Only fetched into $SHELL_RESTORE_DIR. MySQL is not touched: you choose what to load."
+    echo
+    echo -e " ${CYAN}--Check Latest Backups:${RESET}  | aws s3 ls $S3_BUCKET/ --human-readable | grep -E 'xbstream|xbcrypt'"
     echo
     echo "======================================================================================================================"
     exit 1
@@ -104,7 +117,11 @@ restore_backup(){
 echo
 echo "======================================================================================================================"
 echo
-echo -e "${GREEN} Starting MySQL restore using Xtrabackup:${RESET} $FULL_BACKUP + ${#INCREMENTAL_BACKUPS[@]} incremental backup(s)"
+if [ -n "$DUMP_FOLDER" ]; then
+    echo -e "${GREEN} Fetching the MySQL Shell archive (MySQL is not touched):${RESET} $FULL_BACKUP"
+else
+    echo -e "${GREEN} Starting MySQL restore using Xtrabackup:${RESET} $FULL_BACKUP + ${#INCREMENTAL_BACKUPS[@]} incremental backup(s)"
+fi
 echo
 echo -e "${CYAN} All output is being logged to:${RESET} $LOG_FILE"
 echo
@@ -121,7 +138,15 @@ echo
 echo -e "${YELLOW}Checking the backups and the encryption key...${RESET}"
 command -v aws > /dev/null || fail "AWS CLI is not installed or not in PATH. Please install the AWS CLI v2."
 
-[[ "$FULL_BACKUP" == *-dbfull.xbstream ]] || fail "The first backup must be a full backup (<time>-dbfull.xbstream): $FULL_BACKUP"
+if [ -n "$DUMP_FOLDER" ]; then
+    [ ${#INCREMENTAL_BACKUPS[@]} -eq 0 ] || fail "A MySQL Shell archive has no incremental backups: give it alone."
+    command -v xbcrypt > /dev/null || fail "xbcrypt (part of Percona XtraBackup) is not installed."
+    [ ! -e "$DUMP_FOLDER" ] || fail "$DUMP_FOLDER already exists: load from it, or delete it first."
+else
+    [[ "$FULL_BACKUP" == *-dbfull.xbstream ]] || fail "The first backup must be a full backup (<time>-dbfull.xbstream) or a MySQL Shell archive (full-instance-backup-<time>.tar.xbcrypt): $FULL_BACKUP"
+    command -v xtrabackup > /dev/null || fail "xtrabackup (part of Percona XtraBackup) is not installed."
+    command -v xbstream > /dev/null || fail "xbstream (part of Percona XtraBackup) is not installed."
+fi
 PREVIOUS_BACKUP="$FULL_BACKUP"
 for BACKUP in "${INCREMENTAL_BACKUPS[@]}"; do
     [[ "$BACKUP" == *-dbincr.xbstream ]] || fail "Not an incremental backup (<time>-dbincr.xbstream): $BACKUP"
@@ -145,6 +170,38 @@ printf '%s' "$ENCRYPTION_KEY" > "$KEY_FILE"
 unset ENCRYPTION_KEY
 echo -e "${YELLOW}Backups found in the bucket, encryption key read from AWS Secrets Manager ($ENCRYPTION_KEY_SECRET).${RESET}"
 echo
+
+# === MySQL Shell archive: only fetched, then the script ends here, so MySQL, the datadir and the backup chains are not touched ===
+if [ -n "$DUMP_FOLDER" ]; then
+    # Only root can read the unpacked dump: it is not encrypted:
+    mkdir -p -m 700 "$SHELL_RESTORE_DIR"
+    echo -e "${YELLOW}Fetching $FULL_BACKUP into $SHELL_RESTORE_DIR...${RESET}"
+
+    # One command: streamed from the bucket, decrypted and unpacked on the way. tar does not decompress the dump's files: util.loadDump reads them as they are (zstd).
+    # With pipefail, a failure of any of the three fails the line. An incomplete folder could be loaded by mistake, so it is deleted:
+    aws s3 cp "$S3_BUCKET/$FULL_BACKUP" - | xbcrypt --decrypt --encrypt-algo=AES256 --encrypt-key-file="$KEY_FILE" | tar -xvf - -C "$SHELL_RESTORE_DIR" || {
+        rm -rf "$DUMP_FOLDER"
+        fail "The fetch failed (see above) and the incomplete folder was deleted. MySQL was not touched."; }
+    echo
+
+    FETCH_DURATION=$(($(date +%s) - START_TIME))
+    echo -e "${GREEN}Fetch Completed - ⏳ Total duration: $((FETCH_DURATION / 3600))h $(((FETCH_DURATION % 3600) / 60))m $((FETCH_DURATION % 60))s ${RESET}"
+    echo
+    echo -e "${CYAN}Nothing is restored yet. Choose what to load, in MySQL Shell (mysqlsh --login-path=local --js):${RESET}"
+    echo -e "  - Check first, without changing anything: util.loadDump('$DUMP_FOLDER', {dryRun: true})"
+    echo -e "  - The whole instance: util.loadDump('$DUMP_FOLDER')"
+    echo -e "  - One database:       util.loadDump('$DUMP_FOLDER', {includeSchemas: ['db_name']})"
+    echo -e "  - One table:          util.loadDump('$DUMP_FOLDER', {includeTables: ['db_name.table_name']})"
+    echo
+    echo -e "${CYAN}Reminders for the load:${RESET}"
+    echo -e "  - The server needs local_infile=ON during the load: SET GLOBAL local_infile=ON, then OFF again afterwards."
+    echo -e "  - Objects that already exist stop the load: drop them first, or load on another server."
+    echo -e "  - Users are loaded only with {loadUsers: true}."
+    echo -e "  - The load is written to the binary log, so replicas get it too. To keep it on this server only: {skipBinlog: true}."
+    echo -e "  - The dump's binary log position, for a point-in-time recovery, is in $DUMP_FOLDER/@.json"
+    echo -e "  - The folder is not encrypted. When you finish: rm -rf $DUMP_FOLDER"
+    exit 0
+fi
 
 # From here on, a failure leaves MySQL stopped and the datadir incomplete: say so before the script ends (set -e):
 trap 'echo -e "${RED}╰┈➤ Error: The restore failed (line $LINENO). mysqld is stopped and ${DATA_DIR} is incomplete: fix the error above and run the script again.${RESET}"' ERR
