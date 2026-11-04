@@ -69,7 +69,8 @@ An example run. The chain state holds `mysql-bin.000041`; the server has `000040
 4. The chain state holds `000044`. The next run starts from `000045`.
 
 - **A gap** (a missing binlog number) means MySQL purged binlogs before they were uploaded (`binlog_expire_logs_seconds`). Point-in-time recovery cannot cross it, so every run fails until a person takes a new full backup and starts a new chain from that backup's binlog.
-- **No upload at all** means the numbering went backwards (`RESET BINARY LOGS AND GTIDS`, a restored or rebuilt server): a new full backup and a new chain. `--help` lists which binlog to start from in each case.
+- **No upload at all** means the numbering went backwards (`RESET BINARY LOGS AND GTIDS`, a rebuilt server): a new full backup and a new chain. `--help` lists which binlog to start from in each case.
+- **After a restore** with [`mysql_restore_v2_aws.sh`](../mysql_restore_script/mysql_restore_v2_aws.sh), the chain state is deleted, so every run fails until a person takes a new full backup and starts a new chain from that backup's binlog. Without this, the restored server's new binlogs would go into the old chain without an error.
 - Each server has its own folder in the bucket, and an upload never overwrites a file: a binlog with the same name from another sequence makes the upload fail instead.
 - Retention: keep the binlogs as long as the full backups (N + 4 days, see [the backup workflow](mysql_backup_workflow.md)).
 
