@@ -105,7 +105,9 @@ flowchart LR
 - Each incremental holds only the pages changed since the backup before it. After its upload, a backup's position (`xtrabackup_checkpoints`) becomes the **chain state** in `/opt/scripts/mysql_backup.state`: the base of the next incremental.
 - A failed backup or upload leaves the chain state on the last backup in the bucket, so the next incremental continues from there: the chain has no holes.
 - A full backup starts a new chain. The cron example in the script header takes fulls on Monday and Thursday, and incrementals on the other days.
-- To restore Saturday: Thursday's full, then Friday's and Saturday's incrementals, in this order (and the binlogs for a later moment). [`mysql_restore_v2_aws.sh`](../mysql_restore_script/mysql_restore_v2_aws.sh) does this. It also deletes the chain state, because an incremental taken on top of the old chain after a restore would miss changes without any error. Incrementals then fail until a full backup starts a new chain.
+- To restore Saturday: Thursday's full, then Friday's and Saturday's incrementals, in this order. [`mysql_restore_v2_aws.sh`](../mysql_restore_script/mysql_restore_v2_aws.sh) does this. It also deletes the chain state, because an incremental taken on top of the old chain after a restore would miss changes without any error. Incrementals then fail until a full backup starts a new chain. It deletes the binlog chain state as well, for the same reason (see [the binlog workflow](mysql_binlog_backup_workflow.md)).
+- After the restore, MySQL is closed to clients until a person runs `systemctl restart mysqld`, so nothing can write before the checks or a binlog replay.
+- For a moment later than the backup: `mysql_restore_v2_aws.sh --fetch_binlogs <server>` fetches the binlogs from the position the data reached and prints how to replay them. A DBA replays them by hand, up to the chosen moment.
 - Retention: to restore any moment of the last N days, keep every backup N + 4 days. A restore point can need a full backup up to 4 days older than itself (Thursday's full, three incrementals and a day of binlogs).
 
 ## What it writes

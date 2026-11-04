@@ -106,8 +106,12 @@ show_help(){
         "After a gap in the chain" "Take a new full backup, then start from the binary log that backup starts from:" \
         "(binary logs purged before they were uploaded)" "  xtrabackup_binlog_info in the backup, or binlogFile in the @.json file of a MySQL Shell dump." \
         "" "" \
+        "After a restore from a backup" "Take a new full backup, then start from the binary log that backup starts from:" \
+        "(the restore deleted the tracking file)" "  grep binlog_pos /opt/scripts/mysql_backup.state/xtrabackup_info" \
+        "" "  Not the oldest binary log on the server: that is the restored backup's cut-off copy of an old one." \
+        "" "" \
         "After a numbering reset, a rebuilt server or failover" "Take a new full backup, then start from the oldest binary log on this server:" \
-        "(RESET BINARY LOGS AND GTIDS, restore from backup)" "  the first row of SHOW BINARY LOGS."
+        "(RESET BINARY LOGS AND GTIDS)" "  the first row of SHOW BINARY LOGS."
     echo
     echo "================================================================================================================================="
 }
