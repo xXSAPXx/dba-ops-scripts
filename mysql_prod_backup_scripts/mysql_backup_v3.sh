@@ -559,6 +559,15 @@ save_backup_metrics_success() {
     printf "node_mysql_${METRICS_NAME}_status{instance=\"$SERVER_NAME\"} 0\n" > "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom.$$"
     printf "node_mysql_${METRICS_NAME}_duration_seconds{instance=\"$SERVER_NAME\"} $DURATION_BACKUP\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom.$$"
 
+    # The size of this backup in bytes: the XtraBackup file or the MySQL Shell archive, whichever this run made.
+    # A metric with an empty or non-numeric value makes node_exporter drop the whole file, so skip a value that could not be read:
+    local BACKUP_SIZE=$(stat -c %s "${BACKUP_DIR}/${XTRABACKUP_FILE}" "${BACKUP_DIR}/full-instance-backup-${CURRENT_TIME}.tar.xbcrypt" 2>/dev/null | head -n 1)
+    if [[ "$BACKUP_SIZE" =~ ^[0-9]+$ ]]; then
+        printf "node_mysql_${METRICS_NAME}_size_bytes{instance=\"$SERVER_NAME\"} $BACKUP_SIZE\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom.$$"
+    else
+        echo -e "${YELLOW}Warning: Unable to read the size of this backup, skipping node_mysql_${METRICS_NAME}_size_bytes metric.${RESET}"
+    fi
+
     # Rename the temporary file atomically.
     # This avoids the node exporter seeing half a file.
     mv "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom.$$" \

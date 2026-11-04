@@ -171,6 +171,7 @@ check "the named lock is released after the backup" - "has been released" 'db_lo
 check "the lock session runs with --unbuffered" - "" 'grep -q -- --unbuffered "$T/mysql.args"'
 check "xtrabackup runs without --no-server-version-check" - "" '! grep -q -- --no-server-version-check "$T/xtrabackup.args"'
 check "gcloud does not inherit the run lock (fd 9)" - "" '[ ! -e "$T/gcloud_has_fd9" ]'
+check "the size metric is the size of the backup file" - "" '[ "$(metric node_mysql_backup_size_bytes)" = "$(stat -c %s "$(find "$T/bucket" -name "*-dbfull.xbstream")")" ] && [ "$(metric node_mysql_backup_size_bytes)" -gt 0 ]'
 check "each metric is in the status file once" - "" '[ -z "$(awk "{print \$1}" "$T/textfile/mysql_backup_status.prom" | sort | uniq -d)" ]'
 check "the backup is encrypted with the key from Secret Manager, in a file, not on a command line" - "Encryption key read from GCP Secret Manager" 'grep -q -- "--encrypt=AES256 --encrypt-key-file=$T/shm/mysql_backup_key\." "$T/xtrabackup.args" && [ "$(cat "$T/key_seen")" = "$KEY" ] && [ "$(wc -c < "$T/key_seen")" = 32 ] && ! grep -q "$KEY" "$T/xtrabackup.args" "$T/out" "$T/backup.log"'
 check "the key file is gone from the RAM disk after the backup" - "" 'no_key_left'
@@ -188,6 +189,7 @@ check "no base: the incremental fails and says to take a full backup" 1 "No base
 fresh; run --xtrabackup; FULL_LSN=$(to_lsn)
 fresh; run --xtrabackup_incremental
 check "incremental from the last backup, uploaded as dbincr, its own metrics" 0 "Saved Successful Transfer Metrics for Incremental XtraBackup" 'grep -q -- "--incremental-basedir=$T/state/lsn " "$T/xtrabackup.args" && [ "$(find "$T/bucket" -name "*-dbincr.xbstream" | wc -l)" = 1 ] && [ "$(inc_metric node_mysql_incremental_backup_status)" = 0 ] && [ "$(inc_metric node_mysql_incremental_backup_transfer_status)" = 0 ]'
+check "the incremental has its own size metric, the size of its file" - "" '[ "$(inc_metric node_mysql_incremental_backup_size_bytes)" = "$(stat -c %s "$(find "$T/bucket" -name "*-dbincr.xbstream")")" ]'
 check "the chain moved forward, and the local copy is gone" - "" '[ "$(to_lsn)" != "$FULL_LSN" ] && [ -z "$(find "$T/backup" -name "*-dbincr.xbstream")" ] && no_key_left'
 INC_LSN=$(to_lsn)
 fresh; UPLOAD_FAIL=1 run --xtrabackup_incremental
@@ -218,6 +220,7 @@ wait $A; RC=$?; sleep 0.3; cp "$T/out_a" "$T/out"
 check "the other backup finishes normally" 0 "Saved Successful Transfer Metrics for XtraBackup" 'db_lock_released'
 
 fresh; XTRABACKUP_FAIL=1 run --xtrabackup
+check "xtrabackup fails: no size metric for a failed backup" 1 "XtraBackup failed." '[ -z "$(metric node_mysql_backup_size_bytes)" ]'
 check "xtrabackup fails: failure metrics, lock released, nothing uploaded" 1 "XtraBackup failed." '[ "$(metric node_mysql_backup_status)" = 1 ] && db_lock_released && [ "$(uploads)" = 0 ]'
 
 fresh; XTRABACKUP_SLEEP=3 bash "$T/backup.sh" --xtrabackup > "$T/out" 2>&1 & S=$!
@@ -258,6 +261,7 @@ touch -d "4 days ago" "$T/backup/full-instance-backup-old.tar" "$T/backup/full-i
 touch -d "1 day ago" "$T/backup/full-instance-backup-recent.tar"
 run --mysql_shell
 check "MySQL Shell backup and upload succeed" 0 "Saved Successful Transfer Metrics for MySQL Shell Backup" '[ "$(find "$T/bucket" -name "full-instance-backup-*.tar.xbcrypt" | wc -l)" = 1 ] && [ "$(cat "$T/lock_during_backup")" = held ] && db_lock_released'
+check "MySQL Shell: the size metric is the size of the archive" - "" '[ "$(metric node_mysql_backup_size_bytes)" = "$(stat -c %s "$(find "$T/bucket" -name "full-instance-backup-*.tar.xbcrypt")")" ]'
 check "the archive goes through xbcrypt with the key file, and the key file is gone after it" - "" 'grep -q -- "--encrypt-algo=AES256 --encrypt-key-file=$T/shm/mysql_backup_key\." "$T/xbcrypt.args" && [ "$(cat "$T/key_seen")" = "$KEY" ] && no_key_left'
 check "the archive is a plain tar (not compressed again) with the dump folder at its top" - "" 'A=$(find "$T/bucket" -name "full-instance-backup-*.tar.xbcrypt"); ! gzip -t "$A" 2>/dev/null && tar -tf "$A" | grep -q "^full-instance-backup-.*-mysql-shell/@.json$" && ! tar -tf "$A" | grep -qv "^full-instance-backup-.*-mysql-shell/"'
 check "cleanup removes .tar and .tar.gz archives older than 3 days, keeps newer ones" - "" '[ ! -e "$T/backup/full-instance-backup-old.tar" ] && [ ! -e "$T/backup/full-instance-backup-old.tar.gz" ] && [ -e "$T/backup/full-instance-backup-recent.tar" ]'
