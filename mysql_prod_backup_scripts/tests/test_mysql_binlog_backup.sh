@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Tests mysql_binlog_backup_v2.sh against a mocked MySQL and gcloud. No MySQL server, bucket or root needed.
+# Tests mysql_binlog_backup_v2.sh against a mocked MySQL, xbcrypt and gcloud. No MySQL server, bucket or root needed.
 #
 # Run on Linux (WSL works):         bash mysql_prod_backup_scripts/tests/test_mysql_binlog_backup.sh
 # With GNU timeout where the default timeout is uutils (Ubuntu 25.10+, as on WSL Ubuntu 26.04):
@@ -16,6 +16,7 @@ SRC="$HERE/../mysql_binlog_backup_v2.sh"
 T=$(mktemp -d /tmp/binlogtest.XXXX)
 TRACK="$T/state/last_binlog_backup.txt"
 SERVER="test-server"
+KEY=abcdefghijklmnopqrstuvwxyz012345
 mkdir -p "$T/bin" "$T/datadir" "$T/bucket" "$T/textfile" "$T/state"
 
 # Hung uploads leave sleep processes behind with uutils timeout; kill them at the end.
@@ -33,13 +34,14 @@ sed -e "s|^DATA_DIR=.*|DATA_DIR=\"$T/datadir\"|" \
     -e "s|^TEXTFILE_COLLECTOR_DIR=.*|TEXTFILE_COLLECTOR_DIR=\"$T/textfile/\"|" \
     -e "s|^LOCK_FILE=.*|LOCK_FILE=\"$T/lock\"|" \
     -e "s|^LOG_FILE=.*|LOG_FILE=\"$T/backup.log\"|" \
+    -e "s|^ENCRYPTED_BINLOG_DIR=.*|ENCRYPTED_BINLOG_DIR=\"$T/upload\"|" \
     -e "s|^SERVER_NAME=.*|SERVER_NAME=\"$SERVER\"|" \
     -e 's|^UPLOAD_TIMEOUT=.*|UPLOAD_TIMEOUT="2s"|' \
     -e 's|--kill-after=1m|--kill-after=2s|' \
     -e "s|^\( *\)timeout --kill-after|\1${TIMEOUT_BIN:-timeout} --kill-after|" "$SRC" > "$T/backup.sh"
 
-REPLACED=$(grep -cE "^(DATA_DIR|LAST_BINLOG_BACKUP_FILE|TEXTFILE_COLLECTOR_DIR|LOCK_FILE|LOG_FILE|SERVER_NAME|UPLOAD_TIMEOUT)=" "$T/backup.sh")
-grep -q -- "${TIMEOUT_BIN:-timeout} --kill-after=2s" "$T/backup.sh" && [ "$REPLACED" -eq 7 ] || {
+REPLACED=$(grep -cE "^(DATA_DIR|LAST_BINLOG_BACKUP_FILE|TEXTFILE_COLLECTOR_DIR|LOCK_FILE|LOG_FILE|ENCRYPTED_BINLOG_DIR|SERVER_NAME|UPLOAD_TIMEOUT)=" "$T/backup.sh")
+grep -q -- "${TIMEOUT_BIN:-timeout} --kill-after=2s" "$T/backup.sh" && [ "$REPLACED" -eq 8 ] || {
     echo "FAIL  could not point the script's settings at the test directory (did a variable name change?)"; exit 1; }
 echo "Testing $SRC with $(${TIMEOUT_BIN:-timeout} --version | head -n 1)"
 echo
@@ -60,13 +62,29 @@ case "$Q" in
 esac
 EOF
 
-# Mock gcloud: storage cp --if-generation-match=0 SRC gs://DST, into $T/bucket.
+# Mock xbcrypt: marks the data as encrypted, and records its arguments and the key in its environment. XBCRYPT_FAIL fails it.
+cat > "$T/bin/xbcrypt" <<'EOF'
+#!/bin/bash
+echo "$*" > "$T/xbcrypt.args"
+echo "${XBCRYPT_ENCRYPTION_KEY:-}" > "$T/key_seen"
+[ -n "${XBCRYPT_FAIL:-}" ] && { cat > /dev/null; echo "xbcrypt: failed" >&2; exit 1; }
+echo encrypted; cat
+EOF
+
+# Mock gcloud: secrets versions access latest --secret=NAME prints the key (KEY_FAIL fails it, KEY_VALUE replaces it).
+# storage cp --if-generation-match=0 SRC gs://DST, into $T/bucket.
 # FAIL_ON=<file> fails that upload, HANG_ON=<file> hangs it, HANG_HARD_ON=<file> hangs it and ignores the stop signal.
 # The hang runs in a child process, like gcloud's own workers, to check that a survivor does not keep the lock.
 cat > "$T/bin/gcloud" <<'EOF'
 #!/bin/bash
+if [ "$1 $2 $3 $4" = "secrets versions access latest" ]; then
+    [ "$5" = "--secret=<ENCRYPT_KEY>" ] || { echo "mock gcloud: unexpected secret: $5" >&2; exit 2; }
+    [ -n "${KEY_FAIL:-}" ] && { echo "ERROR: (gcloud.secrets.versions.access) PERMISSION_DENIED: Permission denied" >&2; exit 1; }
+    printf '%s\n' "${KEY_VALUE:-abcdefghijklmnopqrstuvwxyz012345}"
+    exit 0
+fi
 [ "$1 $2 $3" = "storage cp --if-generation-match=0" ] || { echo "mock gcloud: unexpected arguments: $*" >&2; exit 2; }
-src="$4"; dst="$T/bucket/${5#gs://}"; name=$(basename "$src")
+src="$4"; dst="$T/bucket/${5#gs://}"; name=$(basename "$src" .xbcrypt)
 [ "${FAIL_ON:-}" = "$name" ] && { echo "ERROR: (gcloud.storage.cp) HTTPError 503: Service unavailable" >&2; exit 1; }
 [ "${HANG_ON:-}" = "$name" ] && { sleep 600 & echo $! >> "$T/hung.pids"; wait; }
 [ "${HANG_HARD_ON:-}" = "$name" ] && { trap '' TERM; sleep 600 & echo $! >> "$T/hung.pids"; wait; }
@@ -159,6 +177,15 @@ if [ "$(id -u)" -ne 0 ]; then
 else
     echo "SKIP  tracking file cannot be written (needs a non-root user)"
 fi
+
+echo "--- encryption"
+rm -f "$TRACK"; server 200 201; run --init_binlog_chain mysql-bin.000200
+KEY_FAIL=1 run $C;                       check "secret not readable: the run fails without rotating the binlog" 1 "mysql-bin.000199" "Unable to read the encryption key <ENCRYPT_KEY> from GCP Secret Manager" '[ "$(tail -n 1 "$T/index")" = mysql-bin.000201 ] && [ "$(status_metric)" = 1 ]'
+KEY_VALUE=short run $C;                  check "key of the wrong length: the run fails without rotating the binlog" 1 "mysql-bin.000199" "has 5 characters instead of 32" '[ "$(tail -n 1 "$T/index")" = mysql-bin.000201 ]'
+XBCRYPT_FAIL=1 run $C;                   check "xbcrypt fails: the run fails, tracking stays, no encrypted copy left" 1 "mysql-bin.000199" "Error encrypting binary log file: mysql-bin.000200" '[ -z "$(ls -A "$T/upload")" ]'
+FAIL_ON=mysql-bin.000200 run $C;         check "failed upload: the encrypted copy is deleted, the next run encrypts it again" 1 "mysql-bin.000199" "Error backing up binary log file: mysql-bin.000200" '[ -z "$(ls -A "$T/upload")" ]'
+run $C;                                  check "the binlogs reach the bucket encrypted, as .xbcrypt, and no copy stays" 0 - "Saved Success Metrics" 'O=$(find "$T/bucket" -name "mysql-bin.000200.xbcrypt"); [ -n "$O" ] && [ "$(head -n 1 "$O")" = encrypted ] && [ -z "$(find "$T/bucket" -name "mysql-bin.000200")" ] && [ -z "$(ls -A "$T/upload")" ]'
+check "xbcrypt gets the key in its environment, never on a command line or in the log" 0 - "" 'grep -q "$KEY" "$T/key_seen" && ! grep -q "$KEY" "$T/xbcrypt.args" "$T/out" "$T/backup.log"'
 
 echo "--- options and log"
 run --help;          check "--help explains which binary log to start from" 0 - "Which binary log to start the chain from"

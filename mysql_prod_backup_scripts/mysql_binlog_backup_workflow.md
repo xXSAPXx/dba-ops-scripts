@@ -1,6 +1,6 @@
 # MySQL binlog backup script: workflow
 
-How [`mysql_binlog_backup_v2_aws.sh`](mysql_binlog_backup_v2_aws.sh) works. The diagrams leave the cloud out: **bucket** is the S3 or GCS bucket, and **secret store** is where the encryption key is kept (AWS Secrets Manager today). The GCP script [`mysql_binlog_backup_v2.sh`](mysql_binlog_backup_v2.sh) follows the same flow, and gets encryption when it is ported.
+How [`mysql_binlog_backup_v2.sh`](mysql_binlog_backup_v2.sh) (GCP) and [`mysql_binlog_backup_v2_aws.sh`](mysql_binlog_backup_v2_aws.sh) (AWS) work: the same logic, with different cloud commands. The diagrams leave the cloud out: **bucket** is the GCS or S3 bucket, and **secret store** is where the encryption key is kept (GCP Secret Manager or AWS Secrets Manager).
 
 | Option | What it does |
 |---|---|
@@ -70,9 +70,25 @@ An example run. The chain state holds `mysql-bin.000041`; the server has `000040
 
 - **A gap** (a missing binlog number) means MySQL purged binlogs before they were uploaded (`binlog_expire_logs_seconds`). Point-in-time recovery cannot cross it, so every run fails until a person takes a new full backup and starts a new chain from that backup's binlog.
 - **No upload at all** means the numbering went backwards (`RESET BINARY LOGS AND GTIDS`, a rebuilt server): a new full backup and a new chain. `--help` lists which binlog to start from in each case.
-- **After a restore** with [`mysql_restore_v2_aws.sh`](../mysql_restore_script/mysql_restore_v2_aws.sh), the chain state is deleted, so every run fails until a person takes a new full backup and starts a new chain from that backup's binlog. Without this, the restored server's new binlogs would go into the old chain without an error.
+- **After a restore** with [`mysql_restore_v2.sh`](../mysql_restore_script/mysql_restore_v2.sh) (AWS: [`mysql_restore_v2_aws.sh`](../mysql_restore_script/mysql_restore_v2_aws.sh)), the chain state is deleted, so every run fails until a person takes a new full backup and starts a new chain from that backup's binlog. Without this, the restored server's new binlogs would go into the old chain without an error.
 - Each server has its own folder in the bucket, and an upload never overwrites a file: a binlog with the same name from another sequence makes the upload fail instead.
 - Retention: keep the binlogs as long as the full backups (N + 4 days, see [the backup workflow](mysql_backup_workflow.md)).
+
+## Cron
+
+`/etc/cron.d/mysql_binlog_backup`, every 15 minutes (on AWS, `mysql_binlog_backup_v2_aws.sh`):
+
+```
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/15 * * * * root /opt/scripts/mysql_binlog_backup_v2.sh --continuous_binlog_backup > /dev/null 2>&1
+```
+
+- **`PATH`:** cron's own is short, and the script finds the cloud CLI with `which`. Without it, a CLI in `/usr/local/bin` looks not installed and the backup fails.
+- **Start the chain by hand before enabling it:** `--init_binlog_chain mysql-bin.NNNNNN` (`--help` shows which binlog). Otherwise every run fails with "No binlog chain to continue".
+- **How often:** every 15-30 minutes. The binlogs of that time, and the active one, are not in the bucket yet, so this is how much a lost server can lose.
+- **The output:** the script logs itself to `/var/log/mysql_binlog_backup.log`, so cron's copy goes to `/dev/null`.
+- **The file:** owned by root, mode 644, ending with a new line, and with no dot in its name, or cron ignores it. The script needs `chmod 700`.
+- **A slow upload:** a run that finds the last one still uploading skips with exit 0, so it never piles up.
 
 ## What it writes
 
