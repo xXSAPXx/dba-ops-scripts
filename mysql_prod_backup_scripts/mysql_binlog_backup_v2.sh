@@ -1,11 +1,48 @@
 #!/bin/env bash
 
+# =================================================================================================================================
+# BEFORE THE FIRST RUN ON A SERVER: what to set up and what to decide (details in the notes and at the variables below).
+#
+# Set up:
+#  - GCS_BUCKET: the bucket and folder of this server's binlogs.
+#  - ENCRYPTION_KEY_SECRET: the GCP Secret Manager secret with the 32-character key, best the same as the full backups'. Keep the
+#    secret for as long as any binlog encrypted with it: without the key those binlogs cannot be restored.
+#  - DATA_DIR: the folder of the binary logs (the folder of log_bin_basename), when it is not the datadir.
+#  - The server's service account: storage.objects.create and storage.objects.list on the bucket (storage.objects.get to restore), secretmanager.versions.access
+#    on the secret. The VM's access scopes must also allow Cloud Storage and Secret Manager (the cloud-platform scope does).
+#  - Installed: the Google Cloud CLI (gcloud), and xbcrypt (part of Percona XtraBackup).
+#  - MySQL login for a user that may run SHOW BINARY LOGS and FLUSH BINARY LOGS: mysql_config_editor set --login-path=local, or /root/.my.cnf.
+#  - ENCRYPTED_BINLOG_DIR (/backup/binlog_upload): room for one encrypted binary log (max_binlog_size).
+#  - /opt/scripts: the scripts, and the binlog chain's tracking file (LAST_BINLOG_BACKUP_FILE).
+#  - node_exporter reads TEXTFILE_COLLECTOR_DIR (--collector.textfile.directory), for the binlog backup metrics.
+#  - The log rotation: cp mysql_binlog_backup.logrotate.example /etc/logrotate.d/mysql_binlog_backup
+#  - The chain, started once by hand: --init_binlog_chain <binary log> (--help shows which one), then the cron entry for
+#    --continuous_binlog_backup.
+#
+# Decide:
+#  - How often cron runs it (15-30 minutes): the binlogs of that time, and the active one, are not in the bucket yet.
+#  - binlog_expire_logs_seconds on the server: longer than the backups could ever stop, or binlogs are purged before their upload (a gap).
+#  - The retention: as long as the full backups, N + 4 days (see mysql_backup_v3.sh).
+#  - The alerts: node_mysql_binlog_backup_status, the age of the last binlog backup, and the active binlog minus the last backed up one.
+#  - UPLOAD_TIMEOUT: well above the slowest upload of one binary log.
+# =================================================================================================================================
+
 set -uo pipefail
 
-# The script is used to backup MySQL binlog files to Google Cloud Storage: 
+# No core dumps: a crashing xbcrypt would write its memory, and the encryption key in it, to disk (systemd-coredump):
+ulimit -c 0
+
+# The GCP version of mysql_binlog_backup_v2_aws.sh: the same logic, with the upload to Google Cloud Storage instead of Amazon S3.
+# gcloud takes its credentials from the server's service account.
+# The script is used to backup MySQL binlog files to Google Cloud Storage:
 # A person starts a binlog chain once with --init_binlog_chain, then cron runs --continuous_binlog_backup every 15-30 minutes.
 # It writes binlog backup metrics in /node_exporter/textfile_collector/ to be scraped by Prometheus.
-# It logs every run (normal execution and errors, with colors) to /var/log/mysql_binlog_backup.log. Rotation: mysql_binlog_backup.logrotate.example.
+# It logs every run (normal execution and errors, with colors) to /var/log/mysql_binlog_backup.log. Before the script runs from cron,
+# install its rotation: cp mysql_binlog_backup.logrotate.example /etc/logrotate.d/mysql_binlog_backup (the log grows without it).
+# It encrypts every binary log (xbcrypt, AES256) before the upload, with a key read from GCP Secret Manager: the bucket holds only
+# <binary log>.xbcrypt files. To decrypt one: XBCRYPT_ENCRYPTION_KEY=<key> xbcrypt --decrypt --encrypt-algo=AES256 < <file>.xbcrypt > <file>
+# Bucket retention: keep the binlogs as long as the full backups (N + 4 days, see mysql_backup_v3.sh), so a restore can always replay
+# the binlogs from the full backup or any incremental after it.
 
 
 # Colors for output:
@@ -17,10 +54,17 @@ YELLOW="\e[33m"
 RESET="\e[0m"
 
 DATA_DIR="/var/lib/mysql"
-LAST_BINLOG_BACKUP_FILE="/opt/last_binlog_backup.txt"
+# The tracking file of the binlog chain: the last binary log uploaded to the bucket. Delete it only to start a new chain (see --help):
+LAST_BINLOG_BACKUP_FILE="/opt/scripts/mysql_binlog_backup.state"
 GCP_BINARY_PATH=$(which gcloud) || { echo -e "${RED}Error: gcloud CLI is not installed or not in PATH. Please install Google Cloud SDK.${RESET}"; }
-# Set the GCS bucket of this server before the first run (the value below is the dev bucket). Binlogs go to <bucket>/<server name>/<date>/:
+# Set the GCP bucket and folder of this server before the first run (the value below is the dev bucket).
+# Binlogs go to <bucket>/<folder>/<server name>/<date>/:
 GCS_BUCKET="gs://db-dela-gamification-dev-src-backup/binlog_backups"
+# The GCP Secret Manager secret with the encryption key (32 characters). Set the secret of this server before the first run
+# (the value below is a placeholder; the secret is in the same GCP project as this server). Without this key the binlog backups cannot be restored:
+ENCRYPTION_KEY_SECRET="<ENCRYPT_KEY>"
+# Each binary log is encrypted into this folder before its upload, and the encrypted copy is deleted after it:
+ENCRYPTED_BINLOG_DIR="/backup/binlog_upload"
 SERVER_NAME=$(hostname -s)
 TEXTFILE_COLLECTOR_DIR="/var/lib/node_exporter/textfile_collector/"
 LOCK_FILE="/var/lock/mysql_binlog_backup.lock"
@@ -42,7 +86,7 @@ show_help(){
         "" "It uploads nothing itself: the next --continuous_binlog_backup run uploads <binary log> and every binary log after it." \
         "" "It refuses to run while a chain exists ($LAST_BINLOG_BACKUP_FILE): to start over, delete that file first." \
         "" "" \
-        "--continuous_binlog_backup" "Upload the closed binary logs of the chain to the GCP bucket and save backup monitoring metrics." \
+        "--continuous_binlog_backup" "Encrypt the closed binary logs of the chain, upload them to the GCP bucket and save backup monitoring metrics." \
         "" "Run it from cron every 15-30 minutes. It fails until a chain is started with --init_binlog_chain," \
         "" "and it stops with an error when a binary log is missing from the chain (a gap)." \
         "" "" \
@@ -57,13 +101,17 @@ show_help(){
         "New server, or one that never had binlog backups" "The oldest binary log on the server: the first row of SHOW BINARY LOGS." \
         "" "" \
         "Server that already has binlog backups" "The binary log after the last one in the bucket. To find the last one:" \
-        "(script reinstalled, tracking file lost)" "  gcloud storage ls \"$GCS_BUCKET/$SERVER_NAME/**\" | awk -F/ '{print \$NF}' | sort | tail -n 1" \
+        "(script reinstalled, tracking file lost)" "  gcloud storage ls \"$GCS_BUCKET/$SERVER_NAME/**\" | awk -F/ '{print \$NF}' | sed 's/\.xbcrypt\$//' | sort | tail -n 1" \
         "" "" \
         "After a gap in the chain" "Take a new full backup, then start from the binary log that backup starts from:" \
         "(binary logs purged before they were uploaded)" "  xtrabackup_binlog_info in the backup, or binlogFile in the @.json file of a MySQL Shell dump." \
         "" "" \
+        "After a restore from a backup" "Take a new full backup, then start from the binary log that backup starts from:" \
+        "(the restore deleted the tracking file)" "  grep binlog_pos /opt/scripts/mysql_backup.state/xtrabackup_info" \
+        "" "  Not the oldest binary log on the server: that is the restored backup's cut-off copy of an old one." \
+        "" "" \
         "After a numbering reset, a rebuilt server or failover" "Take a new full backup, then start from the oldest binary log on this server:" \
-        "(RESET BINARY LOGS AND GTIDS, restore from backup)" "  the first row of SHOW BINARY LOGS."
+        "(RESET BINARY LOGS AND GTIDS)" "  the first row of SHOW BINARY LOGS."
     echo
     echo "================================================================================================================================="
 }
@@ -150,6 +198,23 @@ fi
 # 10# reads the number as decimal (a leading zero would make bash read 000008 as an invalid octal number):
 LAST_BACKED_UP_NUMBER=$((10#${LAST_BACKED_UP_BINLOG##*.}))
 
+# Read the encryption key from GCP Secret Manager, once per run. It stays in this script's memory only: xbcrypt takes it from its
+# environment (XBCRYPT_ENCRYPTION_KEY), so it is never on a command line (ps shows those to every user), on disk or in the log.
+# It is read before the FLUSH below, so a run without the key fails without rotating the binary log:
+ENCRYPTION_KEY=$($GCP_BINARY_PATH secrets versions access latest --secret="$ENCRYPTION_KEY_SECRET") || {
+    echo -e "${RED}Error: Unable to read the encryption key $ENCRYPTION_KEY_SECRET from GCP Secret Manager.${RESET}"
+    return 1; }
+
+# AES256 needs a key of exactly 32 characters (xbcrypt would fail with an invalid key length):
+if [ ${#ENCRYPTION_KEY} -ne 32 ]; then
+    echo -e "${RED}Error: The encryption key $ENCRYPTION_KEY_SECRET has ${#ENCRYPTION_KEY} characters instead of 32.${RESET}"
+    return 1
+fi
+
+mkdir -p "$ENCRYPTED_BINLOG_DIR" || {
+    echo -e "${RED}Error: Unable to create the folder for the encrypted binary logs: $ENCRYPTED_BINLOG_DIR.${RESET}"
+    return 1; }
+
 # Get the list of binary log files: 
 BINLOG_LIST=$(mysql --login-path=local -B -N -e "SHOW BINARY LOGS;" | awk '{print $1}') || {
     echo -e "${RED}Error: Unable to retrieve the list of binary log files from MySQL.${RESET}"; 
@@ -165,7 +230,7 @@ mysql --login-path=local -e "FLUSH BINARY LOGS;" || {
 # Number of binary log files uploaded in this run:
 BINLOG_UPLOADED_COUNT=0
 
-# Loop through the list of binary log files and copy them to GCS bucket:
+# Loop through the list of binary log files and copy them to the GCP bucket:
 for BINLOG_FILE in $BINLOG_LIST; do
     # Check if the binary log file has already been backed up by checking the local binlog tracking file:
     if [[ "$BINLOG_FILE" > "$LAST_BACKED_UP_BINLOG" ]]; then
@@ -181,18 +246,33 @@ for BINLOG_FILE in $BINLOG_LIST; do
         fi
 
         echo -e "${YELLOW}----Backing up binary log file: $BINLOG_FILE----${RESET}"
-        
-        # Copy the binary log file to GCS bucket.
+
+        # Encrypt the binary log (AES256) into the upload folder. Only this xbcrypt command gets the key, in its environment:
+        ENCRYPTED_BINLOG="$ENCRYPTED_BINLOG_DIR/$BINLOG_FILE.xbcrypt"
+        XBCRYPT_ENCRYPTION_KEY="$ENCRYPTION_KEY" xbcrypt --encrypt-algo=AES256 < "$DATA_DIR/$BINLOG_FILE" > "$ENCRYPTED_BINLOG"
+        BINLOG_ENCRYPTION_STATUS=$?
+
+        # Check if the binary log file was encrypted successfully:
+        if [ $BINLOG_ENCRYPTION_STATUS -ne 0 ]; then
+            echo -e "${RED}Error encrypting binary log file: $BINLOG_FILE${RESET}"
+            rm -f "$ENCRYPTED_BINLOG"
+            return 1 # Failure
+        fi
+
+        # Copy the encrypted binary log file to the GCP bucket.
         # --if-generation-match=0 makes the upload fail if an object with this name already exists, so a binlog with the
-        # same name from another binlog sequence (restore, reset, rebuild) is never silently skipped or overwritten:
+        # same name from another binlog sequence (restore, reset, rebuild) is never silently skipped or overwritten.
         # One folder per server, so the binary logs of different servers (failover, rebuilt server, cloned VM) never mix:
-        BINLOG_DESTINATION="$GCS_BUCKET/$SERVER_NAME/$(date +%Y-%m-%d)/$BINLOG_FILE"
+        BINLOG_DESTINATION="$GCS_BUCKET/$SERVER_NAME/$(date +%Y-%m-%d)/$BINLOG_FILE.xbcrypt"
         # timeout stops an upload that hangs (network stall, stuck login), so this run fails and the next one retries, instead of the hung
         # run holding the lock and every later run skipping. --kill-after kills gcloud if it ignores the stop signal.
         # 9>&- keeps the lock out of gcloud and its worker processes: uutils timeout (Ubuntu 25.10+) kills only gcloud itself, and a
         # surviving worker that still held the lock would make every later run skip:
-        timeout --kill-after=1m "$UPLOAD_TIMEOUT" $GCP_BINARY_PATH storage cp --if-generation-match=0 "$DATA_DIR/$BINLOG_FILE" "$BINLOG_DESTINATION" 9>&-
+        timeout --kill-after=1m "$UPLOAD_TIMEOUT" $GCP_BINARY_PATH storage cp --if-generation-match=0 "$ENCRYPTED_BINLOG" "$BINLOG_DESTINATION" 9>&-
         BINLOG_TRANSFER_STATUS=$?
+
+        # The encrypted copy is no longer needed (after a failed upload, the next run encrypts the binary log again):
+        rm -f "$ENCRYPTED_BINLOG"
 
         # Check if the binary log file was copied successfully:
         if [ $BINLOG_TRANSFER_STATUS -ne 0 ]; then

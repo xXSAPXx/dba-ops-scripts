@@ -1,17 +1,63 @@
 #!/bin/bash
 
+# =================================================================================================================================
+# BEFORE THE FIRST RUN ON A SERVER: what to set up and what to decide (details in the numbered notes and at the variables below).
+#
+# Set up:
+#  - GCP_BUCKET: the bucket and folder of this server's backups.
+#  - ENCRYPTION_KEY_SECRET: the GCP Secret Manager secret with the 32-character key. Keep the secret for as long as any backup
+#    encrypted with it: without the key those backups cannot be restored.
+#  - The server's service account: storage.objects.create, storage.objects.get and storage.objects.list on the bucket, secretmanager.versions.access on the secret.
+#    The VM's access scopes must also allow Cloud Storage and Secret Manager (the cloud-platform scope does).
+#  - Installed: Percona XtraBackup (8.4 for MySQL 8.4), the Google Cloud CLI (gcloud), and MySQL Shell for --mysql_shell (which also needs xbcrypt,
+#    part of XtraBackup).
+#  - MySQL login for a user with XtraBackup's privileges: mysql_config_editor set --login-path=local, or /root/.my.cnf.
+#  - BACKUP_DIR (/backup): a disk with room for one full backup and one incremental backup (compressed).
+#  - /opt/scripts: the scripts, and the incremental backup chain's state folder (LSN_DIR).
+#  - node_exporter reads TEXTFILE_COLLECTOR_DIR (--collector.textfile.directory), for the backup metrics.
+#  - The log rotation: cp mysql_backup.logrotate.example /etc/logrotate.d/mysql_backup
+#  - The cron entries in /etc/cron.d/mysql_backup (example in 7).
+#
+# Decide:
+#  - The schedule: how often a full backup, with incremental backups on the other days (example in 7: fulls on Monday and Thursday).
+#  - The retention: N days of restore points need a bucket lifecycle rule of N + 4 days, for these backups and the binlogs (see 9).
+#  - The alerts: node_mysql_backup_* (with two fulls a week, the full backup's age reaches 4 days) and node_mysql_incremental_backup_*.
+#  - UPLOAD_TIMEOUT: well above the slowest normal upload.
+#  - XtraBackup's load on the server: --throttle, --parallel and --compress-zstd-level in the xtrabackup commands.
+#  - The MySQL Shell dump folder: only its archive is encrypted. The folder itself stays unencrypted in BACKUP_DIR for a day or two
+#    (manage_old_backups), for a fast local restore.
+# =================================================================================================================================
+
 set -uo pipefail
 
+# No core dumps: a crashing xtrabackup or xbcrypt would write its memory, and the encryption key in it, to disk (systemd-coredump):
+ulimit -c 0
+
 # Main script for exporting LOGICAL and PHYSICAL production DB backups. (Version 3)
+# The GCP version of mysql_backup_v3_aws.sh: the same backup logic, with the upload to a GCP bucket instead of Amazon S3.
 # 1) Uses Percona (MySQL Shell) or Percona (XtraBackup) to make a full instance backup.
 # 2) Holds the MySQL named lock 'backup_running' during the backup: the application's TRUNCATE scripts check it and do not run while it is held.
 # 3) Releases the lock upon backup completion / failure / interruption. A file lock (flock) keeps a second run of this script from starting.
-# 4) Transfers the backup to specific GCP Bucket, with a time limit (UPLOAD_TIMEOUT).
+# 4) Transfers the backup to a GCP bucket, with a time limit (UPLOAD_TIMEOUT). gcloud takes its credentials from the server's service account.
 # 5) Updates node_exporter text collector files for Grafana backup monitoring in case of SUCCESS or FAILURE.
 # 6) Backups can be performed LOCALLY by both utilities if needed.
-# 7) Logs every backup run (normal execution and errors, with colors) to /var/log/mysql_backup.log. Rotation: mysql_backup.logrotate.example.
-#    The script logs itself, so cron's copy of the output goes to /dev/null, e.g. in /etc/cron.d/mysql_backup:
-#    0 2 * * * root /opt/scripts/mysql_backup_v3.sh --xtrabackup > /dev/null 2>&1
+# 7) Logs every backup run (normal execution and errors, with colors) to /var/log/mysql_backup.log. Before the script runs from cron,
+#    install its rotation: cp mysql_backup.logrotate.example /etc/logrotate.d/mysql_backup (the log grows without it).
+#    The script logs itself, so cron's copy of the output goes to /dev/null, e.g. in /etc/cron.d/mysql_backup (full backups on Monday
+#    and Thursday, incremental backups on the other days):
+#    0 2 * * 1,4 root /opt/scripts/mysql_backup_v3.sh --xtrabackup > /dev/null 2>&1
+#    0 2 * * 0,2,3,5,6 root /opt/scripts/mysql_backup_v3.sh --xtrabackup_incremental > /dev/null 2>&1
+# 8) Encrypts the XtraBackup backups and the MySQL Shell archives (AES256) with a key read from GCP Secret Manager. The key is kept on the
+#    RAM disk (/dev/shm) for the backup only, and never printed. To restore: xbstream -x < <backup>.xbstream, then
+#    xtrabackup --decrypt=AES256 --encrypt-key-file=<file with the key> --decompress --remove-original --target-dir=<dir>, then --prepare.
+#    To restore a MySQL Shell archive: xbcrypt --decrypt --encrypt-algo=AES256 --encrypt-key-file=<file with the key> < <archive>.tar.xbcrypt | tar -xf -
+#    then util.loadDump on the folder (it reads the zstd files itself).
+# 9) Incremental XtraBackup backups in a chain (--xtrabackup_incremental): each one holds only the pages changed since the backup before it
+#    (the full backup, or the incremental before it). A full backup (--xtrabackup) starts a new chain. To restore: decrypt every backup
+#    of the chain as in 8), then xtrabackup --prepare --apply-log-only --target-dir=<full>, then for each incremental in order
+#    xtrabackup --prepare --apply-log-only --target-dir=<full> --incremental-dir=<incremental> (the last one without --apply-log-only).
+#    Bucket retention: to restore any moment of the last N days, keep every backup N + 4 days. A restore point can need a full backup
+#    up to 4 days older than itself (Thursday's full, then three incrementals and a day of binlogs).
 
 
 # Colors for output:
@@ -27,10 +73,26 @@ CURRENT_TIME=`date +%Y-%m-%d-%H%M%S`
 DATA_DIR="/var/lib/mysql"
 BACKUP_DIR="/backup"
 BACKUP_DIR_SHELL="${BACKUP_DIR}/full-instance-backup-${CURRENT_TIME}-mysql-shell/"
+# The file of this run's XtraBackup backup (--xtrabackup_incremental changes it to <time>-dbincr.xbstream):
+XTRABACKUP_FILE="${CURRENT_TIME}-dbfull.xbstream"
+# The state of the incremental backup chain: xtrabackup_checkpoints (the LSN) of the last backup uploaded to the bucket, the base of the
+# next --xtrabackup_incremental. Delete it only to stop the chain: --xtrabackup_incremental then fails until a full backup (--xtrabackup) runs:
+LSN_DIR="/opt/scripts/mysql_backup.state"
+# Each XtraBackup run writes its own LSN folder here, and it replaces LSN_DIR only after the backup is in the bucket:
+NEW_LSN_DIR="/opt/scripts/mysql_backup.state.new"
 # Empty if gcloud is not installed: main reports it once the log has started.
 GCP_BINARY_PATH=$(which gcloud 2>/dev/null)
+# Set the GCP bucket and folder of this server before the first run (the value below is the dev bucket):
 GCP_BUCKET="gs://db-dela-gamification-dev-src-backup"
+# The GCP Secret Manager secret with the encryption key (32 characters). Set the secret of this server before the first run
+# (the value below is a placeholder; the secret is in the same GCP project as this server). Without this key the backups cannot be restored:
+ENCRYPTION_KEY_SECRET="<ENCRYPT_KEY>"
+# Set by fetch_encryption_key for the duration of the backup:
+ENCRYPTION_KEY_FILE=""
 TEXTFILE_COLLECTOR_DIR="/var/lib/node_exporter/textfile_collector/"
+# The name in the metrics and their files: backup for full backups, incremental_backup for --xtrabackup_incremental (set in main),
+# so each has its own status, durations and age, e.g. node_mysql_incremental_backup_status in mysql_incremental_backup_status.prom:
+METRICS_NAME="backup"
 LOCK_FILE="/var/lock/mysql_backup.lock"
 LOG_FILE="/var/log/mysql_backup.log"
 # An upload that takes longer is stopped and the transfer fails. Keep it well above the slowest normal upload (node_mysql_backup_transfer_duration_seconds):
@@ -44,11 +106,14 @@ show_help() {
     echo
     echo -e "${GREEN}Available Backup Options:${RESET} 🔧"
     echo
-    echo -e "  ${CYAN}--xtrabackup${RESET}           | Backup the DB instance using Percona XtraBackup and transfer to GCP Bucket."
-    echo -e "  ${CYAN}--mysql_shell${RESET}          | Backup the DB instance using Percona MySQL Shell and transfer to GCP Bucket."
-    echo -e "  ${CYAN}--xtrabackup_local${RESET}     | Perform a local backup using Percona XtraBackup."
-    echo -e "  ${CYAN}--mysql_shell_local${RESET}    | Perform a local backup using Percona MySQL Shell."
-    echo -e "  ${CYAN}--help${RESET}                 | Display this help message."
+    echo -e "  ${CYAN}--xtrabackup${RESET}              | Backup the DB instance using Percona XtraBackup (encrypted) and transfer to the GCP bucket."
+    echo -e "                              | It starts a new chain for --xtrabackup_incremental."
+    echo -e "  ${CYAN}--xtrabackup_incremental${RESET}  | Incremental backup using Percona XtraBackup (encrypted): only the pages changed since the last backup"
+    echo -e "                              | of the chain, transferred to the GCP bucket. It fails until a full backup (--xtrabackup) starts a chain."
+    echo -e "  ${CYAN}--mysql_shell${RESET}             | Backup the DB instance using Percona MySQL Shell (encrypted archive) and transfer to the GCP bucket."
+    echo -e "  ${CYAN}--xtrabackup_local${RESET}        | Perform a local backup using Percona XtraBackup (encrypted)."
+    echo -e "  ${CYAN}--mysql_shell_local${RESET}       | Perform a local backup using Percona MySQL Shell (encrypted archive)."
+    echo -e "  ${CYAN}--help${RESET}                    | Display this help message."
     echo
     echo -e "  Every backup run is logged to $LOG_FILE (with colors: less -R $LOG_FILE)."
     echo
@@ -128,8 +193,9 @@ acquire_backup_lock(){
         return 1
     fi
 
-    # Setup Trap for safety | If the script exits / is interrupted / or is killed, close the session to release the lock:
-    trap 'release_backup_lock; echo -e "${RED}-- Lock released by trap. --${RESET}"' EXIT INT TERM
+    # Setup Trap for safety | If the script exits / is interrupted / or is killed, close the session to release the lock,
+    # and remove the encryption key from the RAM disk:
+    trap 'remove_encryption_key; release_backup_lock; echo -e "${RED}-- Lock released by trap. --${RESET}"' EXIT INT TERM
 
     echo -e "${GREEN}-- Lock acquired successfully. --${RESET}"
 }
@@ -142,16 +208,66 @@ release_backup_lock(){
 
 
 
+# Function to read the encryption key from GCP Secret Manager into a file on the RAM disk (/dev/shm), for this backup only.
+# xtrabackup reads the key only from a file (--encrypt-key-file): on the RAM disk it never reaches a disk, and mktemp makes the file
+# readable by root only. The key never goes on a command line (ps shows those to every user) and is never printed, so it stays out of the log:
+fetch_encryption_key(){
+    if [ -z "$GCP_BINARY_PATH" ]; then
+        echo -e "${RED}Error: gcloud CLI is not installed or not in PATH: the encryption key cannot be read from GCP Secret Manager.${RESET}"
+        return 1
+    fi
+
+    local ENCRYPTION_KEY
+    ENCRYPTION_KEY=$(${GCP_BINARY_PATH} secrets versions access latest --secret="$ENCRYPTION_KEY_SECRET") || {
+        echo -e "${RED}Error: Unable to read the encryption key $ENCRYPTION_KEY_SECRET from GCP Secret Manager.${RESET}"
+        return 1; }
+
+    # AES256 needs a key of exactly 32 characters (xtrabackup would fail with an invalid key length):
+    if [ ${#ENCRYPTION_KEY} -ne 32 ]; then
+        echo -e "${RED}Error: The encryption key $ENCRYPTION_KEY_SECRET has ${#ENCRYPTION_KEY} characters instead of 32.${RESET}"
+        return 1
+    fi
+
+    ENCRYPTION_KEY_FILE=$(mktemp -p /dev/shm mysql_backup_key.XXXXXX) || {
+        echo -e "${RED}Error: Unable to create the encryption key file on the RAM disk /dev/shm.${RESET}"
+        return 1; }
+
+    # printf is built into bash: the key is written to the file without ever being on a command line:
+    printf '%s' "$ENCRYPTION_KEY" > "$ENCRYPTION_KEY_FILE"
+    echo -e "${GREEN}-- Encryption key read from GCP Secret Manager ($ENCRYPTION_KEY_SECRET). --${RESET}"
+}
+
+
+# Function to remove the encryption key file from the RAM disk (safe to call twice, and when there is no key file):
+remove_encryption_key(){
+    [ -n "$ENCRYPTION_KEY_FILE" ] && rm -f "$ENCRYPTION_KEY_FILE"
+    ENCRYPTION_KEY_FILE=""
+}
+
+
+
 # Function for MySQL Shell Backup:
 mysql_shell_backup(){
 
     command -v mysqlsh >/dev/null 2>&1
     if [ $? -eq 0 ]; then
+        # Checked before the dump: without xbcrypt the run would fail only at the archive, hours later:
+        command -v xbcrypt >/dev/null 2>&1 || {
+            echo -e "${RED}xbcrypt (part of Percona XtraBackup) is not installed: the archive cannot be encrypted.${RESET}"
+            return 1; }
+
         acquire_backup_lock || return 1
         echo -e "${YELLOW}Starting MySQL Shell Backup at ${CURRENT_TIME} ${RESET}"
 
         # Start time of the backup script:
         START_BACKUP="$(date +%s)"
+
+        # Read the encryption key for the archive, also before the dump (the lock's trap removes it if the script is stopped):
+        fetch_encryption_key || {
+            release_backup_lock && \
+            trap - EXIT INT TERM && \
+            echo -e "${YELLOW}-- Lock named ${BACKUP_LOCK_NAME} has been released and trap removed. --${RESET}"
+            return 1; }
 
         # Perform a full instance backup with MySQL Shell: // Ensures consistency without locking!
         mysqlsh --login-path=local -S /var/lib/mysql/mysql.sock --js <<EOF
@@ -163,22 +279,31 @@ EOF
         # Save Backup Exit Code:
         MYSQL_SHELL_EXIT_CODE=$?
 
-        # Release the lock (closing the input of the lock session ends it) and clear the trap:
+        # Release the lock (closing the input of the lock session ends it): the archive does not need it.
+        # The trap stays until the key is removed:
         release_backup_lock && \
-        trap - EXIT INT TERM && \
-        echo -e "${YELLOW}-- Lock named ${BACKUP_LOCK_NAME} has been released and trap removed. --${RESET}"
+        echo -e "${YELLOW}-- Lock named ${BACKUP_LOCK_NAME} has been released. --${RESET}"
 
         if [ $MYSQL_SHELL_EXIT_CODE -ne 0 ]; then
+            remove_encryption_key
+            trap - EXIT INT TERM
             echo -e "${RED}MySQL Shell Backup Failed!${RESET}"
             return 1
         fi
 
         # Archive the MySQL Shell backup folder without compressing it again: the dump files are already compressed (zstd).
+        # xbcrypt encrypts it (AES256) as it is written, so an unencrypted archive never reaches the disk. With pipefail, a failure of tar or xbcrypt fails this step.
         # The relative name stores the folder as full-instance-backup-<time>-mysql-shell/ instead of under its full path:
-        cd ${BACKUP_DIR} && time tar -cf full-instance-backup-${CURRENT_TIME}.tar full-instance-backup-${CURRENT_TIME}-mysql-shell
+        cd ${BACKUP_DIR} && time tar -cf - full-instance-backup-${CURRENT_TIME}-mysql-shell | \
+            xbcrypt --encrypt-algo=AES256 --encrypt-key-file="${ENCRYPTION_KEY_FILE}" > full-instance-backup-${CURRENT_TIME}.tar.xbcrypt
 
         # Save Tar exit code:
         FOLDER_ARCHIVE_STATUS=$?
+
+        # The archive no longer needs the key: remove it from the RAM disk and clear the trap.
+        remove_encryption_key
+        trap - EXIT INT TERM
+
         if [ $FOLDER_ARCHIVE_STATUS -ne 0 ]; then
             echo -e "${RED}Backup Folder Archive Failed!${RESET}"
             return 1
@@ -213,13 +338,26 @@ xtrabackup_backup() {
         # Go to BACKUP_DIR:
         cd ${BACKUP_DIR} || { echo -e "${RED}Error: Failed to change directory to ${BACKUP_DIR} ${RESET}"; return 1; }
 
-        # Run XtraBackup and check for failure
+        # Read the encryption key for this backup (the lock's trap removes it if the script is stopped):
+        fetch_encryption_key || {
+            release_backup_lock && \
+            trap - EXIT INT TERM && \
+            echo -e "${YELLOW}-- Lock named ${BACKUP_LOCK_NAME} has been released and trap removed. --${RESET}"
+            return 1; }
+
+        # Run XtraBackup and check for failure. Every file is compressed, then encrypted (AES256) with the key file on the RAM disk.
+        # --extra-lsndir also writes xtrabackup_checkpoints (the LSN) to NEW_LSN_DIR: once uploaded, this backup starts a new chain:
+        rm -rf "${NEW_LSN_DIR}"
         xtrabackup --backup --datadir="${DATA_DIR}" --stream=xbstream --throttle=60 --parallel=8 --compress \
-            --compress-zstd-level=1 --compress-threads=8 --login-path=local \
-            > "${BACKUP_DIR}/${CURRENT_TIME}-dbfull.xbstream"
+            --compress-zstd-level=1 --compress-threads=8 --encrypt=AES256 --encrypt-key-file="${ENCRYPTION_KEY_FILE}" \
+            --encrypt-threads=8 --extra-lsndir="${NEW_LSN_DIR}" --login-path=local \
+            > "${BACKUP_DIR}/${XTRABACKUP_FILE}"
 
         # Save Backup Exit Code:
         XTRABACKUP_EXIT_CODE=$?
+
+        # The backup no longer needs the key: remove it from the RAM disk.
+        remove_encryption_key
 
         # Release the lock (closing the input of the lock session ends it) and clear the trap:
         release_backup_lock && \
@@ -248,7 +386,75 @@ xtrabackup_backup() {
 
 
 
-# Function to Delete old local backups (MySQL Shell archives: .tar, and .tar.gz from v2):
+# Function for an incremental XtraBackup Backup in a chain: only the pages changed since the last backup in the bucket (LSN_DIR):
+xtrabackup_incremental_backup() {
+    if command -v xtrabackup >/dev/null 2>&1; then
+
+        # Without a base there is no chain to continue: a person takes a full backup (--xtrabackup), which starts a new chain:
+        if [ ! -f "${LSN_DIR}/xtrabackup_checkpoints" ]; then
+            echo -e "${RED}Error: No base for the incremental backup: ${LSN_DIR}/xtrabackup_checkpoints does not exist. Take a full backup first (--xtrabackup).${RESET}"
+            return 1
+        fi
+
+        XTRABACKUP_FILE="${CURRENT_TIME}-dbincr.xbstream"
+        acquire_backup_lock || return 1
+        echo -e "${YELLOW}Starting Incremental XtraBackup at ${CURRENT_TIME} from $(grep '^to_lsn' "${LSN_DIR}/xtrabackup_checkpoints") ${RESET}"
+
+        # Start time of the backup script:
+        START_BACKUP="$(date +%s)"
+
+        # Go to BACKUP_DIR:
+        cd ${BACKUP_DIR} || { echo -e "${RED}Error: Failed to change directory to ${BACKUP_DIR} ${RESET}"; return 1; }
+
+        # Read the encryption key for this backup (the lock's trap removes it if the script is stopped):
+        fetch_encryption_key || {
+            release_backup_lock && \
+            trap - EXIT INT TERM && \
+            echo -e "${YELLOW}-- Lock named ${BACKUP_LOCK_NAME} has been released and trap removed. --${RESET}"
+            return 1; }
+
+        # Run XtraBackup as for the full backup, plus --incremental-basedir: it copies only the pages changed after the LSN in LSN_DIR.
+        # --extra-lsndir writes this backup's LSN to NEW_LSN_DIR: once uploaded, it is the base of the next incremental:
+        rm -rf "${NEW_LSN_DIR}"
+        xtrabackup --backup --datadir="${DATA_DIR}" --stream=xbstream --throttle=60 --parallel=8 --compress \
+            --compress-zstd-level=1 --compress-threads=8 --encrypt=AES256 --encrypt-key-file="${ENCRYPTION_KEY_FILE}" \
+            --encrypt-threads=8 --incremental-basedir="${LSN_DIR}" --extra-lsndir="${NEW_LSN_DIR}" --login-path=local \
+            > "${BACKUP_DIR}/${XTRABACKUP_FILE}"
+
+        # Save Backup Exit Code:
+        XTRABACKUP_EXIT_CODE=$?
+
+        # The backup no longer needs the key: remove it from the RAM disk.
+        remove_encryption_key
+
+        # Release the lock (closing the input of the lock session ends it) and clear the trap:
+        release_backup_lock && \
+        trap - EXIT INT TERM && \
+        echo -e "${YELLOW}-- Lock named ${BACKUP_LOCK_NAME} has been released and trap removed. --${RESET}"
+
+        if [ $XTRABACKUP_EXIT_CODE -ne 0 ]; then
+            echo -e "${RED}Incremental XtraBackup failed.${RESET}"
+            return 1
+        fi
+
+        # End time of the backup script.
+        END_BACKUP="$(date +%s)"
+
+        # Calculate backup duration:
+        DURATION_BACKUP="$(( ($END_BACKUP - $START_BACKUP) + 2 ))"
+        echo
+        echo -e "${YELLOW}Duration in Seconds:${RESET} $(($END_BACKUP - $START_BACKUP))"
+        return 0
+
+    else
+        echo -e "${RED}Percona XtraBackup is not installed.${RESET}"
+        return 1
+    fi
+}
+
+
+
+# Function to Delete old local backups (MySQL Shell archives: .tar.xbcrypt, and .tar and .tar.gz from older versions):
 manage_old_backups() {
     time find ${BACKUP_DIR} -mindepth 1 -maxdepth 1 -type d  -name 'full-instance-backup*' -mtime +0 -exec rm -rfv {} \;
     time find ${BACKUP_DIR} -mindepth 1 -maxdepth 1 -type f  -name 'full-instance-backup*.tar*' -mtime +2 -exec rm -rfv {} \;
@@ -258,22 +464,22 @@ manage_old_backups() {
 
 
 
-# Function to Transfer MySQL Shell or XtraBackup to GCP Bucket:
+# Function to Transfer MySQL Shell or XtraBackup to the GCP bucket:
 transfer_backup(){
-    # Start time of the GCP Bucket transfer
+    # Start time of the GCP bucket transfer
     START_TRANS="$(date +%s)"
 
     ############## INITIATE MYSQL_SHELL BACKUP TRANSFER ##############
     if [ -d "$BACKUP_DIR_SHELL" ]; then
         echo -e "${YELLOW}Initiating GCP Bucket Transfer For MySQL Shell Backup.${RESET}"
 
-        # Upload New Backup to GCP Bucket:
+        # Upload New Backup to the GCP bucket:
         # timeout stops an upload that hangs (network stall, stuck login), so the transfer fails instead of the run hanging forever.
         # --kill-after kills gcloud if it ignores the stop signal. 9>&- keeps the run lock (flock) out of gcloud and its worker processes,
         # so a worker that survives the timeout cannot block every later run:
         timeout --kill-after=1m "$UPLOAD_TIMEOUT" ${GCP_BINARY_PATH} storage cp \
-            ${BACKUP_DIR}/full-instance-backup-${CURRENT_TIME}.tar \
-            ${GCP_BUCKET}/full-instance-backup-${CURRENT_TIME}.tar 9>&-
+            ${BACKUP_DIR}/full-instance-backup-${CURRENT_TIME}.tar.xbcrypt \
+            ${GCP_BUCKET}/full-instance-backup-${CURRENT_TIME}.tar.xbcrypt 9>&-
 
         # Check Transfer Code:
         TRANSFER_EXIT_CODE=$?
@@ -298,14 +504,14 @@ transfer_backup(){
 
 
     #################### INITIATE XTRABACKUP TRANSFER ####################
-    elif [ -f "${BACKUP_DIR}/${CURRENT_TIME}-dbfull.xbstream" ]; then
+    elif [ -f "${BACKUP_DIR}/${XTRABACKUP_FILE}" ]; then
 
         echo -e "${YELLOW}Initiating GCP Bucket Transfer For XtraBackup.${RESET}"
 
-        # Upload New Backup to GCP Bucket (time limit and 9>&- as for the MySQL Shell upload above):
+        # Upload New Backup (full or incremental) to the GCP bucket (time limit and 9>&- as for the MySQL Shell upload above):
         timeout --kill-after=1m "$UPLOAD_TIMEOUT" ${GCP_BINARY_PATH} storage cp \
-            ${BACKUP_DIR}/${CURRENT_TIME}-dbfull.xbstream  \
-            ${GCP_BUCKET}/${CURRENT_TIME}-dbfull.xbstream 9>&-
+            ${BACKUP_DIR}/${XTRABACKUP_FILE}  \
+            ${GCP_BUCKET}/${XTRABACKUP_FILE} 9>&-
 
 
         # Check Transfer Code:
@@ -336,48 +542,58 @@ transfer_backup(){
 }
 
 
+# Function to move the incremental backup chain forward once the backup is in the bucket: its LSN folder replaces LSN_DIR and is the base
+# of the next --xtrabackup_incremental. A failed backup or upload never gets here, so the chain stays on the last backup in the bucket:
+advance_backup_chain(){
+    rm -rf "${LSN_DIR}" && mv "${NEW_LSN_DIR}" "${LSN_DIR}" || {
+        echo -e "${RED}Error: Unable to move ${NEW_LSN_DIR} to ${LSN_DIR}: the next incremental backup has no base until a full backup runs.${RESET}"
+        return 1; }
+    echo -e "${GREEN}-- Backup chain moved forward: the next incremental starts from $(grep '^to_lsn' "${LSN_DIR}/xtrabackup_checkpoints"). --${RESET}"
+}
 
-# Function to save BACKUP monitoring metrics in case of SUCCESS:
+
+
+# Function to save BACKUP monitoring metrics in case of SUCCESS (METRICS_NAME: backup or incremental_backup):
 save_backup_metrics_success() {
     # Add Success Backup Stats to Node_Exporter file:
-    printf "node_mysql_backup_status{instance=\"$SERVER_NAME\"} 0\n" > "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
-    printf "node_mysql_backup_duration_seconds{instance=\"$SERVER_NAME\"} $DURATION_BACKUP\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
+    printf "node_mysql_${METRICS_NAME}_status{instance=\"$SERVER_NAME\"} 0\n" > "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom.$$"
+    printf "node_mysql_${METRICS_NAME}_duration_seconds{instance=\"$SERVER_NAME\"} $DURATION_BACKUP\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom.$$"
 
     # Rename the temporary file atomically.
     # This avoids the node exporter seeing half a file.
-    mv "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$" \
-       "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom"
+    mv "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom.$$" \
+       "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom"
 }
 
 
 # Function to save BACKUP monitoring metrics in case of FAILURE:
 save_backup_metrics_failure() {
-    printf "node_mysql_backup_status{instance=\"$SERVER_NAME\"} 1\n" > "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
-    printf "node_mysql_backup_duration_seconds{instance=\"$SERVER_NAME\"} 1\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
-    printf "node_mysql_backup_transfer_status{instance=\"$SERVER_NAME\"} 1\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
-    printf "node_mysql_backup_transfer_duration_seconds{instance=\"$SERVER_NAME\"} 1\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$"
+    printf "node_mysql_${METRICS_NAME}_status{instance=\"$SERVER_NAME\"} 1\n" > "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom.$$"
+    printf "node_mysql_${METRICS_NAME}_duration_seconds{instance=\"$SERVER_NAME\"} 1\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom.$$"
+    printf "node_mysql_${METRICS_NAME}_transfer_status{instance=\"$SERVER_NAME\"} 1\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom.$$"
+    printf "node_mysql_${METRICS_NAME}_transfer_duration_seconds{instance=\"$SERVER_NAME\"} 1\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom.$$"
 
     # Rename the temporary file atomically.
     # This avoids the node exporter seeing half a file.
-    mv "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom.$$" \
-       "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom"
+    mv "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom.$$" \
+       "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom"
 }
 
 
 # Function to save TRANSFER monitoring metrics in case of SUCCESS: / Update Backup Age Timestamp(ms) in a separate prom. file
 save_transfer_metrics_success() {
     # Add Success Transfer Stats to Node_Exporter file:
-    printf "node_mysql_backup_transfer_status{instance=\"$SERVER_NAME\"} 0\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom"
-    printf "node_mysql_backup_transfer_duration_seconds{instance=\"$SERVER_NAME\"} $DURATION_TRANS\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom"
-    printf "node_mysql_last_successful_backup_date{instance=\"$SERVER_NAME\"} $BACKUP_TIMESTAMP\n" > "$TEXTFILE_COLLECTOR_DIR/mysql_backup_age.prom"
+    printf "node_mysql_${METRICS_NAME}_transfer_status{instance=\"$SERVER_NAME\"} 0\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom"
+    printf "node_mysql_${METRICS_NAME}_transfer_duration_seconds{instance=\"$SERVER_NAME\"} $DURATION_TRANS\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom"
+    printf "node_mysql_last_successful_${METRICS_NAME}_date{instance=\"$SERVER_NAME\"} $BACKUP_TIMESTAMP\n" > "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_age.prom"
 }
 
 
 # Function to save TRANSFER monitoring metrics in case of FAILURE:
 save_transfer_metrics_failure() {
     # Add Failure Transfer Stats to Node_Exporter file:
-    printf "node_mysql_backup_transfer_status{instance=\"$SERVER_NAME\"} 1\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom"
-    printf "node_mysql_backup_transfer_duration_seconds{instance=\"$SERVER_NAME\"} 1\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_backup_status.prom"
+    printf "node_mysql_${METRICS_NAME}_transfer_status{instance=\"$SERVER_NAME\"} 1\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom"
+    printf "node_mysql_${METRICS_NAME}_transfer_duration_seconds{instance=\"$SERVER_NAME\"} 1\n" >> "$TEXTFILE_COLLECTOR_DIR/mysql_${METRICS_NAME}_status.prom"
 }
 
 
@@ -396,7 +612,7 @@ function main() {
     # A run that finds the lock taken fails without touching the metrics: the backup that holds it still writes its own.
     # The log starts first, so these errors are logged too (--help and invalid options are not logged):
     case "$1" in
-        --mysql_shell|--xtrabackup|--mysql_shell_local|--xtrabackup_local)
+        --mysql_shell|--xtrabackup|--xtrabackup_incremental|--mysql_shell_local|--xtrabackup_local)
             start_log "$1"
 
             if [ -z "$GCP_BINARY_PATH" ] && [[ "$1" != *_local ]]; then
@@ -447,13 +663,39 @@ function main() {
                 exit 1
             fi
             manage_old_backups
-            transfer_backup
+            # Once the backup is in the bucket, it starts a new chain for --xtrabackup_incremental:
+            transfer_backup && advance_backup_chain
             if [ $? -eq 0 ]; then
                 save_transfer_metrics_success
                 echo -e "${GREEN}Saved Successful Transfer Metrics for XtraBackup.${RESET}"
             else
                 save_transfer_metrics_failure
                 echo -e "${RED}Saved Failed Transfer Metrics for XtraBackup!${RESET}"
+                exit 1
+            fi
+            ;;
+        --xtrabackup_incremental)
+            METRICS_NAME="incremental_backup"
+            xtrabackup_incremental_backup
+            if [ $? -eq 0 ]; then
+                save_backup_metrics_success
+                echo -e "${GREEN}Saved Success Metrics for Incremental XtraBackup Process.${RESET}"
+            else
+                save_backup_metrics_failure
+                echo -e "${RED}Saved Failure Metrics for Incremental XtraBackup Process!${RESET}"
+                exit 1
+            fi
+            manage_old_backups
+            # Once the backup is in the bucket, it is the base of the next incremental:
+            transfer_backup && advance_backup_chain
+            if [ $? -eq 0 ]; then
+                save_transfer_metrics_success
+                echo -e "${GREEN}Saved Successful Transfer Metrics for Incremental XtraBackup.${RESET}"
+                # The incremental backup is in the bucket, so it is not kept on the local disk (a failed upload keeps it until manage_old_backups):
+                rm -fv "${BACKUP_DIR}/${XTRABACKUP_FILE}"
+            else
+                save_transfer_metrics_failure
+                echo -e "${RED}Saved Failed Transfer Metrics for Incremental XtraBackup!${RESET}"
                 exit 1
             fi
             ;;

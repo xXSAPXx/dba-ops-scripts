@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Tests mysql_backup_v3.sh against a mocked MySQL, xtrabackup, mysqlsh and gcloud. No MySQL server, bucket or root needed.
+# Tests mysql_backup_v3.sh against a mocked MySQL, xtrabackup, xbcrypt, mysqlsh and gcloud. No MySQL server, bucket or root needed.
 #
 # Run on Linux (WSL works):         bash mysql_prod_backup_scripts/tests/test_mysql_backup_v3.sh
 # With GNU timeout where the default timeout is uutils (Ubuntu 25.10+, as on WSL Ubuntu 26.04):
@@ -14,7 +14,8 @@ set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 SRC="$HERE/../mysql_backup_v3.sh"
 T=$(mktemp -d /tmp/backuptest.XXXX)
-mkdir -p "$T/bin" "$T/backup" "$T/bucket" "$T/textfile" "$T/datadir"
+mkdir -p "$T/bin" "$T/backup" "$T/bucket" "$T/textfile" "$T/datadir" "$T/state" "$T/shm"
+KEY=abcdefghijklmnopqrstuvwxyz012345
 
 # Hung uploads and lock holders leave processes behind; kill them at the end.
 cleanup(){
@@ -28,6 +29,9 @@ bash -n "$SRC" || { echo "FAIL  syntax check of $SRC"; exit 1; }
 sed -e "s|^DATA_DIR=.*|DATA_DIR=\"$T/datadir\"|" \
     -e "s|^BACKUP_DIR=.*|BACKUP_DIR=\"$T/backup\"|" \
     -e "s|^GCP_BUCKET=.*|GCP_BUCKET=\"gs://test-bucket\"|" \
+    -e "s|^LSN_DIR=.*|LSN_DIR=\"$T/state/lsn\"|" \
+    -e "s|^NEW_LSN_DIR=.*|NEW_LSN_DIR=\"$T/state/lsn.new\"|" \
+    -e "s|mktemp -p /dev/shm|mktemp -p $T/shm|" \
     -e "s|^TEXTFILE_COLLECTOR_DIR=.*|TEXTFILE_COLLECTOR_DIR=\"$T/textfile/\"|" \
     -e "s|^LOCK_FILE=.*|LOCK_FILE=\"$T/run.lock\"|" \
     -e "s|^LOG_FILE=.*|LOG_FILE=\"$T/backup.log\"|" \
@@ -36,8 +40,8 @@ sed -e "s|^DATA_DIR=.*|DATA_DIR=\"$T/datadir\"|" \
     -e 's|while \[ "\$WAITED" -lt 600 \]|while [ "$WAITED" -lt 30 ]|' \
     -e "s|^\( *\)timeout --kill-after|\1${TIMEOUT_BIN:-timeout} --kill-after|" "$SRC" > "$T/backup.sh"
 
-REPLACED=$(grep -cE "^(DATA_DIR|BACKUP_DIR|GCP_BUCKET|TEXTFILE_COLLECTOR_DIR|LOCK_FILE|LOG_FILE|UPLOAD_TIMEOUT)=" "$T/backup.sh")
-[ "$REPLACED" -eq 7 ] && [ "$(grep -c -- "${TIMEOUT_BIN:-timeout} --kill-after=2s" "$T/backup.sh")" -eq 2 ] && grep -q 'while \[ "$WAITED" -lt 30 \]' "$T/backup.sh" || {
+REPLACED=$(grep -cE "^(DATA_DIR|BACKUP_DIR|GCP_BUCKET|LSN_DIR|NEW_LSN_DIR|TEXTFILE_COLLECTOR_DIR|LOCK_FILE|LOG_FILE|UPLOAD_TIMEOUT)=" "$T/backup.sh")
+[ "$REPLACED" -eq 9 ] && grep -q "mktemp -p $T/shm" "$T/backup.sh" && [ "$(grep -c -- "${TIMEOUT_BIN:-timeout} --kill-after=2s" "$T/backup.sh")" -eq 2 ] && grep -q 'while \[ "$WAITED" -lt 30 \]' "$T/backup.sh" || {
     echo "FAIL  could not point the script's settings at the test directory (did a variable name change?)"; exit 1; }
 # The same script with another run lock file: two runs that the run lock cannot stop (as if started on two hosts):
 sed "s|^LOCK_FILE=.*|LOCK_FILE=\"$T/other.lock\"|" "$T/backup.sh" > "$T/backup_otherlock.sh"
@@ -67,7 +71,8 @@ while IFS= read -r line; do
 done
 EOF
 
-# Mock xtrabackup: records its arguments and whether the named lock is held, writes a stream to stdout.
+# Mock xtrabackup: records its arguments, the key it was given and whether the named lock is held, writes a stream to stdout,
+# and an LSN that grows into the folder of --extra-lsndir, as the real one does.
 cat > "$T/bin/xtrabackup" <<'EOF'
 #!/bin/bash
 echo "$*" > "$T/xtrabackup.args"
@@ -75,6 +80,10 @@ h=$(cat "$T/dblock" 2>/dev/null); { [ -n "$h" ] && kill -0 "$h" 2>/dev/null && e
 touch "$T/xtrabackup.started"
 [ -n "${XTRABACKUP_SLEEP:-}" ] && sleep "$XTRABACKUP_SLEEP"
 [ -n "${XTRABACKUP_FAIL:-}" ] && { echo "xtrabackup: Error: failed to execute query 'LOCK INSTANCE FOR BACKUP'" >&2; exit 1; }
+for a in "$@"; do case "$a" in
+    --encrypt-key-file=*) cat "${a#*=}" > "$T/key_seen";;
+    --extra-lsndir=*) mkdir -p "${a#*=}"; n=$(( $(cat "$T/lsn" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$T/lsn"; echo "to_lsn = $n" > "${a#*=}/xtrabackup_checkpoints";;
+esac; done
 echo "xbstream data"
 echo "completed OK!" >&2
 EOF
@@ -88,10 +97,26 @@ h=$(cat "$T/dblock" 2>/dev/null); { [ -n "$h" ] && kill -0 "$h" 2>/dev/null && e
 mkdir -p "$dir" && echo chunk > "$dir/db@table@@0.tsv.zst" && echo '{}' > "$dir/@.json"
 EOF
 
-# Mock gcloud: storage cp SRC gs://DST, into $T/bucket. UPLOAD_FAIL fails it, UPLOAD_HANG hangs it, UPLOAD_HANG_HARD also ignores the stop signal.
+# Mock xbcrypt: passes the data through, so the archive can be read, and records its arguments and the key it was given.
+cat > "$T/bin/xbcrypt" <<'EOF'
+#!/bin/bash
+echo "$*" > "$T/xbcrypt.args"
+for a in "$@"; do case "$a" in --encrypt-key-file=*) cat "${a#*=}" > "$T/key_seen";; esac; done
+[ -n "${XBCRYPT_FAIL:-}" ] && { cat > /dev/null; echo "xbcrypt: failed" >&2; exit 1; }
+cat
+EOF
+
+# Mock gcloud: secrets versions access latest --secret=NAME prints the key (KEY_FAIL fails it, KEY_VALUE replaces it).
+# storage cp SRC gs://DST, into $T/bucket. UPLOAD_FAIL fails it, UPLOAD_HANG hangs it, UPLOAD_HANG_HARD also ignores the stop signal.
 # The hang runs in a child process, like gcloud's own workers, to check that a survivor does not keep the run lock.
 cat > "$T/bin/gcloud" <<'EOF'
 #!/bin/bash
+if [ "$1 $2 $3 $4" = "secrets versions access latest" ]; then
+    [ "$5" = "--secret=<ENCRYPT_KEY>" ] || { echo "mock gcloud: unexpected secret: $5" >&2; exit 2; }
+    [ -n "${KEY_FAIL:-}" ] && { echo "ERROR: (gcloud.secrets.versions.access) PERMISSION_DENIED: Permission denied" >&2; exit 1; }
+    printf '%s\n' "${KEY_VALUE:-abcdefghijklmnopqrstuvwxyz012345}"
+    exit 0
+fi
 [ "$1 $2" = "storage cp" ] || { echo "mock gcloud: unexpected arguments: $*" >&2; exit 2; }
 src="$3"; dst="$T/bucket/${4#gs://}"
 [ -e "/proc/$$/fd/9" ] && echo yes > "$T/gcloud_has_fd9"
@@ -111,7 +136,7 @@ export T PATH="$T/bin:$PATH"
 run_script(){ local s="$1"; shift; bash "$s" "$@" > "$T/out" 2>&1; RC=$?; sleep 0.3; sed -i 's/\x1b\[[0-9;]*m//g' "$T/out"; cat "$T/out" >> "$T/all_out"; }
 run(){ run_script "$T/backup.sh" "$@"; }
 # fresh: empty backup folder, bucket and records of the last run (metrics stay)
-fresh(){ rm -rf "$T"/backup/* "$T"/bucket/* "$T/xtrabackup.args" "$T/xtrabackup.started" "$T/lock_during_backup" "$T/gcloud_has_fd9"; }
+fresh(){ rm -rf "$T"/backup/* "$T"/bucket/* "$T/xtrabackup.args" "$T/xtrabackup.started" "$T/lock_during_backup" "$T/gcloud_has_fd9" "$T/xbcrypt.args" "$T/key_seen" "$T"/shm/*; }
 
 PASSED=0; FAILED=0
 # check NAME EXIT [TEXT] [CONDITION]: EXIT "-" skips the exit code, CONDITION is a shell test
@@ -128,6 +153,9 @@ check(){
 }
 
 metric(){ awk -v m="$1" 'index($0, m "{") == 1 {v=$2} END {print v}' "$T/textfile/mysql_backup_status.prom" 2>/dev/null; }
+inc_metric(){ awk -v m="$1" 'index($0, m "{") == 1 {v=$2} END {print v}' "$T/textfile/mysql_incremental_backup_status.prom" 2>/dev/null; }
+to_lsn(){ awk '/^to_lsn/ {print $3}' "$T/state/lsn/xtrabackup_checkpoints" 2>/dev/null; }
+no_key_left(){ [ -z "$(ls -A "$T/shm")" ]; }
 db_lock_held(){ local h; h=$(cat "$T/dblock" 2>/dev/null); [ -n "$h" ] && kill -0 "$h" 2>/dev/null; }
 # The lock session ends a moment after the script closes its input:
 db_lock_released(){ for _ in $(seq 30); do db_lock_held || return 0; sleep 0.1; done; return 1; }
@@ -144,6 +172,30 @@ check "the lock session runs with --unbuffered" - "" 'grep -q -- --unbuffered "$
 check "xtrabackup runs without --no-server-version-check" - "" '! grep -q -- --no-server-version-check "$T/xtrabackup.args"'
 check "gcloud does not inherit the run lock (fd 9)" - "" '[ ! -e "$T/gcloud_has_fd9" ]'
 check "each metric is in the status file once" - "" '[ -z "$(awk "{print \$1}" "$T/textfile/mysql_backup_status.prom" | sort | uniq -d)" ]'
+check "the backup is encrypted with the key from Secret Manager, in a file, not on a command line" - "Encryption key read from GCP Secret Manager" 'grep -q -- "--encrypt=AES256 --encrypt-key-file=$T/shm/mysql_backup_key\." "$T/xtrabackup.args" && [ "$(cat "$T/key_seen")" = "$KEY" ] && [ "$(wc -c < "$T/key_seen")" = 32 ] && ! grep -q "$KEY" "$T/xtrabackup.args" "$T/out" "$T/backup.log"'
+check "the key file is gone from the RAM disk after the backup" - "" 'no_key_left'
+check "a full backup starts the incremental chain" - "Backup chain moved forward" '[ -f "$T/state/lsn/xtrabackup_checkpoints" ] && [ ! -e "$T/state/lsn.new" ]'
+
+echo "--- the encryption key"
+fresh; KEY_FAIL=1 run --xtrabackup
+check "secret not readable: the backup does not start, lock released" 1 "Unable to read the encryption key <ENCRYPT_KEY> from GCP Secret Manager" '[ ! -e "$T/xtrabackup.args" ] && [ "$(metric node_mysql_backup_status)" = 1 ] && db_lock_released && no_key_left'
+fresh; KEY_VALUE=short run --xtrabackup
+check "key of the wrong length: the backup does not start" 1 "has 5 characters instead of 32" '[ ! -e "$T/xtrabackup.args" ] && db_lock_released && no_key_left'
+
+echo "--- the incremental chain"
+fresh; rm -rf "$T"/state/*; run --xtrabackup_incremental
+check "no base: the incremental fails and says to take a full backup" 1 "No base for the incremental backup" '[ ! -e "$T/xtrabackup.args" ] && [ "$(uploads)" = 0 ] && [ "$(inc_metric node_mysql_incremental_backup_status)" = 1 ]'
+fresh; run --xtrabackup; FULL_LSN=$(to_lsn)
+fresh; run --xtrabackup_incremental
+check "incremental from the last backup, uploaded as dbincr, its own metrics" 0 "Saved Successful Transfer Metrics for Incremental XtraBackup" 'grep -q -- "--incremental-basedir=$T/state/lsn " "$T/xtrabackup.args" && [ "$(find "$T/bucket" -name "*-dbincr.xbstream" | wc -l)" = 1 ] && [ "$(inc_metric node_mysql_incremental_backup_status)" = 0 ] && [ "$(inc_metric node_mysql_incremental_backup_transfer_status)" = 0 ]'
+check "the chain moved forward, and the local copy is gone" - "" '[ "$(to_lsn)" != "$FULL_LSN" ] && [ -z "$(find "$T/backup" -name "*-dbincr.xbstream")" ] && no_key_left'
+INC_LSN=$(to_lsn)
+fresh; UPLOAD_FAIL=1 run --xtrabackup_incremental
+check "failed upload: the chain stays on the last backup in the bucket, the local copy stays" 1 "Transfer to GCP Bucket Failed! (XtraBackup)" '[ "$(to_lsn)" = "$INC_LSN" ] && [ "$(find "$T/backup" -name "*-dbincr.xbstream" | wc -l)" = 1 ] && [ "$(inc_metric node_mysql_incremental_backup_transfer_status)" = 1 ]'
+fresh; XTRABACKUP_FAIL=1 run --xtrabackup_incremental
+check "failed backup: the chain stays, lock released" 1 "Incremental XtraBackup failed." '[ "$(to_lsn)" = "$INC_LSN" ] && db_lock_released && no_key_left'
+fresh; UPLOAD_FAIL=1 run --xtrabackup
+check "a full backup whose upload failed does not start a new chain" 1 "Transfer to GCP Bucket Failed! (XtraBackup)" '[ "$(to_lsn)" = "$INC_LSN" ]'
 
 echo "--- the named lock"
 fresh; sleep 600 & APP=$!; echo $APP >> "$T/pids"; echo $APP > "$T/dblock"
@@ -205,11 +257,14 @@ fresh
 touch -d "4 days ago" "$T/backup/full-instance-backup-old.tar" "$T/backup/full-instance-backup-old.tar.gz"
 touch -d "1 day ago" "$T/backup/full-instance-backup-recent.tar"
 run --mysql_shell
-check "MySQL Shell backup and upload succeed" 0 "Saved Successful Transfer Metrics for MySQL Shell Backup" '[ "$(find "$T/bucket" -name "full-instance-backup-*.tar" | wc -l)" = 1 ] && [ "$(cat "$T/lock_during_backup")" = held ] && db_lock_released'
-check "the archive is a plain tar (not compressed again) with the dump folder at its top" - "" 'A=$(find "$T/bucket" -name "full-instance-backup-*.tar"); ! gzip -t "$A" 2>/dev/null && tar -tf "$A" | grep -q "^full-instance-backup-.*-mysql-shell/@.json$" && ! tar -tf "$A" | grep -qv "^full-instance-backup-.*-mysql-shell/"'
+check "MySQL Shell backup and upload succeed" 0 "Saved Successful Transfer Metrics for MySQL Shell Backup" '[ "$(find "$T/bucket" -name "full-instance-backup-*.tar.xbcrypt" | wc -l)" = 1 ] && [ "$(cat "$T/lock_during_backup")" = held ] && db_lock_released'
+check "the archive goes through xbcrypt with the key file, and the key file is gone after it" - "" 'grep -q -- "--encrypt-algo=AES256 --encrypt-key-file=$T/shm/mysql_backup_key\." "$T/xbcrypt.args" && [ "$(cat "$T/key_seen")" = "$KEY" ] && no_key_left'
+check "the archive is a plain tar (not compressed again) with the dump folder at its top" - "" 'A=$(find "$T/bucket" -name "full-instance-backup-*.tar.xbcrypt"); ! gzip -t "$A" 2>/dev/null && tar -tf "$A" | grep -q "^full-instance-backup-.*-mysql-shell/@.json$" && ! tar -tf "$A" | grep -qv "^full-instance-backup-.*-mysql-shell/"'
 check "cleanup removes .tar and .tar.gz archives older than 3 days, keeps newer ones" - "" '[ ! -e "$T/backup/full-instance-backup-old.tar" ] && [ ! -e "$T/backup/full-instance-backup-old.tar.gz" ] && [ -e "$T/backup/full-instance-backup-recent.tar" ]'
 fresh; MYSQLSH_FAIL=1 run --mysql_shell
 check "MySQL Shell fails: failure metrics, lock released" 1 "MySQL Shell Backup Failed!" '[ "$(metric node_mysql_backup_status)" = 1 ] && db_lock_released'
+fresh; XBCRYPT_FAIL=1 run --mysql_shell
+check "xbcrypt fails: failure metrics, nothing uploaded, no key left" 1 "Backup Folder Archive Failed!" '[ "$(uploads)" = 0 ] && db_lock_released && no_key_left'
 fresh; UPLOAD_HANG=1 run --mysql_shell
 check "MySQL Shell: hung upload is stopped by the timeout" 1 "did not finish within 2s and was stopped"
 
@@ -235,7 +290,7 @@ mv "$T/bin/gcloud" "$T/bin/gcloud.off"
 fresh; run --xtrabackup
 check "gcloud missing: the error reaches the log, the upload fails" 1 "gcloud CLI is not installed" 'grep -q "gcloud CLI is not installed" "$L" && [ "$(metric node_mysql_backup_transfer_status)" = 1 ]'
 fresh; run --xtrabackup_local
-check "gcloud missing: local backups do not report it" 0 "Local XtraBackup Finished Successfully" '! grep -q "gcloud CLI is not installed" "$T/out"'
+check "gcloud missing: a local backup fails too, since it cannot read the key" 1 "the encryption key cannot be read from GCP Secret Manager" '! grep -q "Please install Google Cloud SDK" "$T/out" && [ ! -e "$T/xtrabackup.args" ]'
 mv "$T/bin/gcloud.off" "$T/bin/gcloud"
 
 echo
