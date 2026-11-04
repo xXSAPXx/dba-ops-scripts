@@ -11,7 +11,7 @@
 #  - DATA_DIR: this server's datadir, on a disk with room for the whole database (decompressed). MySQL runs as the systemd service mysqld.
 #  - INCREMENTAL_DIR: a folder on a disk with room for one incremental backup (decompressed).
 #  - SHELL_RESTORE_DIR: a folder on a disk with room for one MySQL Shell dump, to fetch MySQL Shell archives.
-#  - PREPARE_MEMORY: most of this server's free RAM (MySQL is stopped during the restore).
+#  - PREPARE_MEMORY: about half of MemAvailable, checked with MySQL stopped. xtrabackup can't use huge pages reserved for MySQL (see the variable below).
 #  - The relaylog, doublebuff, binlog and log folders the script creates in DATA_DIR: they must match this server's my.cnf.
 #  - Run it as root.
 #
@@ -63,7 +63,8 @@ INCREMENTAL_DIR="/backup/restore_incremental"
 # A MySQL Shell archive is unpacked into a folder here. Not directly in /backup: the backup script's cleanup deletes full-instance-backup*
 # folders there that are over a day old, and tar restores the folder's old date, so the next backup run would delete it:
 SHELL_RESTORE_DIR="/backup/restore_shell"
-# Memory for the prepare (xtrabackup's default is only 100M). MySQL is stopped, so most of the free RAM (production: 64GB, as in mysql_restore.sh):
+# Memory for the prepare (xtrabackup's default is only 100M). Too much can OOM the server: xtrabackup can't use huge pages reserved for MySQL (vm.nr_hugepages).
+# Check with MySQL stopped: grep -E 'HugePages_Total|Hugepagesize|MemAvailable' /proc/meminfo. Then use about half of MemAvailable:
 PREPARE_MEMORY="2G"
 # The incremental backup chain of mysql_backup_v3_aws.sh on this server. The restore deletes it: an incremental from the old chain
 # would succeed without an error but miss changes, so --xtrabackup_incremental fails instead until a full backup starts a new chain:

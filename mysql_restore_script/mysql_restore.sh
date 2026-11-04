@@ -57,6 +57,8 @@ gsutil cat "$BACKUP_PATH" | xbstream -x -C /var/lib/mysql --parallel=16 --decomp
 echo -e "${YELLOW}Restore finished at: $(date) ${RESET}"
 echo
 echo -e "${YELLOW}Preparing backup...${RESET}"
+# Too much --use-memory can OOM the server: xtrabackup can't use huge pages reserved for MySQL (vm.nr_hugepages).
+# Check with MySQL stopped: grep -E 'HugePages_Total|Hugepagesize|MemAvailable' /proc/meminfo. Then use about half of MemAvailable:
 xtrabackup --prepare --use-memory=64GB --target-dir=/var/lib/mysql
 echo -e "${YELLOW}Backup prepared at: $(date) ${RESET}"
 echo
