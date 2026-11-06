@@ -21,7 +21,8 @@
 # Decide:
 #  - The schedule: how often a full backup, with incremental backups on the other days (example in 7: fulls on Monday and Thursday).
 #  - The retention: N days of restore points need a bucket lifecycle rule of N + 4 days, for these backups and the binlogs (see 9).
-#  - The alerts: node_mysql_backup_* (with two fulls a week, the full backup's age reaches 4 days) and node_mysql_incremental_backup_*.
+#  - The alerts: node_mysql_backup_* (with two fulls a week, the full backup's age reaches 4 days), node_mysql_incremental_backup_*
+#    and node_mysql_shell_backup_* (MySQL Shell, on its own schedule).
 #  - UPLOAD_TIMEOUT: well above the slowest normal upload.
 #  - XtraBackup's load on the server: --throttle, --parallel and --compress-zstd-level in the xtrabackup commands.
 #  - The MySQL Shell dump folder: only its archive is encrypted. The folder itself stays unencrypted in BACKUP_DIR for a day or two
@@ -90,8 +91,9 @@ ENCRYPTION_KEY_SECRET="<ENCRYPT_KEY>"
 # Set by fetch_encryption_key for the duration of the backup:
 ENCRYPTION_KEY_FILE=""
 TEXTFILE_COLLECTOR_DIR="/var/lib/node_exporter/textfile_collector/"
-# The name in the metrics and their files: backup for full backups, incremental_backup for --xtrabackup_incremental (set in main),
-# so each has its own status, durations and age, e.g. node_mysql_incremental_backup_status in mysql_incremental_backup_status.prom:
+# The name in the metrics and their files: backup for full backups, incremental_backup for --xtrabackup_incremental and shell_backup
+# for --mysql_shell (set in main), so each has its own status, durations, size and age, e.g. node_mysql_incremental_backup_status in
+# mysql_incremental_backup_status.prom:
 METRICS_NAME="backup"
 LOCK_FILE="/var/lock/mysql_backup.lock"
 LOG_FILE="/var/log/mysql_backup.log"
@@ -641,6 +643,7 @@ function main() {
 
     case "$1" in
         --mysql_shell)
+            METRICS_NAME="shell_backup"
             mysql_shell_backup
             if [ $? -eq 0 ]; then
                 save_backup_metrics_success

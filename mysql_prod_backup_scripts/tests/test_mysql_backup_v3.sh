@@ -154,6 +154,7 @@ check(){
 
 metric(){ awk -v m="$1" 'index($0, m "{") == 1 {v=$2} END {print v}' "$T/textfile/mysql_backup_status.prom" 2>/dev/null; }
 inc_metric(){ awk -v m="$1" 'index($0, m "{") == 1 {v=$2} END {print v}' "$T/textfile/mysql_incremental_backup_status.prom" 2>/dev/null; }
+shell_metric(){ awk -v m="$1" 'index($0, m "{") == 1 {v=$2} END {print v}' "$T/textfile/mysql_shell_backup_status.prom" 2>/dev/null; }
 to_lsn(){ awk '/^to_lsn/ {print $3}' "$T/state/lsn/xtrabackup_checkpoints" 2>/dev/null; }
 no_key_left(){ [ -z "$(ls -A "$T/shm")" ]; }
 db_lock_held(){ local h; h=$(cat "$T/dblock" 2>/dev/null); [ -n "$h" ] && kill -0 "$h" 2>/dev/null; }
@@ -259,14 +260,16 @@ echo "--- MySQL Shell"
 fresh
 touch -d "4 days ago" "$T/backup/full-instance-backup-old.tar" "$T/backup/full-instance-backup-old.tar.gz"
 touch -d "1 day ago" "$T/backup/full-instance-backup-recent.tar"
+cp "$T/textfile/mysql_backup_status.prom" "$T/full_status.before"; cp "$T/textfile/mysql_backup_age.prom" "$T/full_age.before"
 run --mysql_shell
 check "MySQL Shell backup and upload succeed" 0 "Saved Successful Transfer Metrics for MySQL Shell Backup" '[ "$(find "$T/bucket" -name "full-instance-backup-*.tar.xbcrypt" | wc -l)" = 1 ] && [ "$(cat "$T/lock_during_backup")" = held ] && db_lock_released'
-check "MySQL Shell: the size metric is the size of the archive" - "" '[ "$(metric node_mysql_backup_size_bytes)" = "$(stat -c %s "$(find "$T/bucket" -name "full-instance-backup-*.tar.xbcrypt")")" ]'
+check "MySQL Shell writes its own metrics, and the full backup's stay as they were" - "" '[ "$(shell_metric node_mysql_shell_backup_status)" = 0 ] && [ "$(shell_metric node_mysql_shell_backup_transfer_status)" = 0 ] && grep -q "^node_mysql_last_successful_shell_backup_date" "$T/textfile/mysql_shell_backup_age.prom" && cmp -s "$T/full_status.before" "$T/textfile/mysql_backup_status.prom" && cmp -s "$T/full_age.before" "$T/textfile/mysql_backup_age.prom"'
+check "MySQL Shell: the size metric is the size of the archive" - "" '[ "$(shell_metric node_mysql_shell_backup_size_bytes)" = "$(stat -c %s "$(find "$T/bucket" -name "full-instance-backup-*.tar.xbcrypt")")" ]'
 check "the archive goes through xbcrypt with the key file, and the key file is gone after it" - "" 'grep -q -- "--encrypt-algo=AES256 --encrypt-key-file=$T/shm/mysql_backup_key\." "$T/xbcrypt.args" && [ "$(cat "$T/key_seen")" = "$KEY" ] && no_key_left'
 check "the archive is a plain tar (not compressed again) with the dump folder at its top" - "" 'A=$(find "$T/bucket" -name "full-instance-backup-*.tar.xbcrypt"); ! gzip -t "$A" 2>/dev/null && tar -tf "$A" | grep -q "^full-instance-backup-.*-mysql-shell/@.json$" && ! tar -tf "$A" | grep -qv "^full-instance-backup-.*-mysql-shell/"'
 check "cleanup removes .tar and .tar.gz archives older than 3 days, keeps newer ones" - "" '[ ! -e "$T/backup/full-instance-backup-old.tar" ] && [ ! -e "$T/backup/full-instance-backup-old.tar.gz" ] && [ -e "$T/backup/full-instance-backup-recent.tar" ]'
 fresh; MYSQLSH_FAIL=1 run --mysql_shell
-check "MySQL Shell fails: failure metrics, lock released" 1 "MySQL Shell Backup Failed!" '[ "$(metric node_mysql_backup_status)" = 1 ] && db_lock_released'
+check "MySQL Shell fails: failure metrics, lock released" 1 "MySQL Shell Backup Failed!" '[ "$(shell_metric node_mysql_shell_backup_status)" = 1 ] && db_lock_released'
 fresh; XBCRYPT_FAIL=1 run --mysql_shell
 check "xbcrypt fails: failure metrics, nothing uploaded, no key left" 1 "Backup Folder Archive Failed!" '[ "$(uploads)" = 0 ] && db_lock_released && no_key_left'
 fresh; UPLOAD_HANG=1 run --mysql_shell
