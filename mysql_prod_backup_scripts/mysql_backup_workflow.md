@@ -138,4 +138,4 @@ The binlogs have [their own cron file](mysql_binlog_backup_workflow.md#cron).
 | `/backup` | Recent backups for a quick restore: XtraBackup files are deleted after 23 hours, MySQL Shell archives after 3 days, and the MySQL Shell dump folder (not encrypted) after a day or two. Incrementals are deleted right after their upload. |
 | `/opt/scripts/mysql_backup.state` | The chain state: the position of the last backup in the bucket |
 | `/var/log/mysql_backup.log` | Every run, with colors (`less -R`) |
-| node_exporter textfile folder | `node_mysql_backup_*` (full and MySQL Shell) and `node_mysql_incremental_backup_*`: status, durations, backup size (`_size_bytes`, after a successful backup), time of the last success |
+| node_exporter textfile folder | `node_mysql_backup_*` (XtraBackup fulls), `node_mysql_incremental_backup_*` and `node_mysql_shell_backup_*` (MySQL Shell): status, durations, backup size (`_size_bytes`, after a successful backup), time of the last success |
