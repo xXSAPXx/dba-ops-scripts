@@ -7,9 +7,12 @@
 #  - GCS_BUCKET: the bucket and folder of this server's binlogs.
 #  - ENCRYPTION_KEY_SECRET: the GCP Secret Manager secret with the 32-character key, best the same as the full backups'. Keep the
 #    secret for as long as any binlog encrypted with it: without the key those binlogs cannot be restored.
+#  - ENCRYPTION_KEY_SERVICE_ACCOUNT: the service account gcloud impersonates to read the secret (--impersonate-service-account).
 #  - DATA_DIR: the folder of the binary logs (the folder of log_bin_basename), when it is not the datadir.
-#  - The server's service account: storage.objects.create and storage.objects.list on the bucket (storage.objects.get to restore), secretmanager.versions.access
-#    on the secret. The VM's access scopes must also allow Cloud Storage and Secret Manager (the cloud-platform scope does).
+#  - The server's service account: storage.objects.create and storage.objects.list on the bucket (storage.objects.get to restore), and
+#    iam.serviceAccounts.getAccessToken on ENCRYPTION_KEY_SERVICE_ACCOUNT (roles/iam.serviceAccountTokenCreator), which has secretmanager.versions.access
+#    on the secret. The VM's access scopes must also allow Cloud Storage, Secret Manager and IAM credentials (the cloud-platform scope does),
+#    and the project needs the IAM Service Account Credentials API enabled.
 #  - Installed: the Google Cloud CLI (gcloud), and xbcrypt (part of Percona XtraBackup).
 #  - MySQL login for a user that may run SHOW BINARY LOGS and FLUSH BINARY LOGS: mysql_config_editor set --login-path=local, or /root/.my.cnf.
 #  - ENCRYPTED_BINLOG_DIR (/backup/binlog_upload): room for one encrypted binary log (max_binlog_size).
@@ -57,12 +60,15 @@ DATA_DIR="/var/lib/mysql"
 # The tracking file of the binlog chain: the last binary log uploaded to the bucket. Delete it only to start a new chain (see --help):
 LAST_BINLOG_BACKUP_FILE="/opt/scripts/mysql_binlog_backup.state"
 GCP_BINARY_PATH=$(which gcloud) || { echo -e "${RED}Error: gcloud CLI is not installed or not in PATH. Please install Google Cloud SDK.${RESET}"; }
-# Set the GCP bucket and folder of this server before the first run (the value below is the dev bucket).
+# Set the GCP bucket and folder of this server before the first run (the value below is a placeholder).
 # Binlogs go to <bucket>/<folder>/<server name>/<date>/:
-GCS_BUCKET="gs://db-dela-gamification-dev-src-backup/binlog_backups"
+GCS_BUCKET="gs://<BUCKET_NAME>/binlog_backups"
 # The GCP Secret Manager secret with the encryption key (32 characters). Set the secret of this server before the first run
 # (the value below is a placeholder; the secret is in the same GCP project as this server). Without this key the binlog backups cannot be restored:
 ENCRYPTION_KEY_SECRET="<ENCRYPT_KEY>"
+# The service account gcloud impersonates to read the secret (--impersonate-service-account), by its email. Set it before the
+# first run (the value below is a placeholder):
+ENCRYPTION_KEY_SERVICE_ACCOUNT="<SERVICE_ACCOUNT>"
 # Each binary log is encrypted into this folder before its upload, and the encrypted copy is deleted after it:
 ENCRYPTED_BINLOG_DIR="/backup/binlog_upload"
 SERVER_NAME=$(hostname -s)
@@ -201,8 +207,8 @@ LAST_BACKED_UP_NUMBER=$((10#${LAST_BACKED_UP_BINLOG##*.}))
 # Read the encryption key from GCP Secret Manager, once per run. It stays in this script's memory only: xbcrypt takes it from its
 # environment (XBCRYPT_ENCRYPTION_KEY), so it is never on a command line (ps shows those to every user), on disk or in the log.
 # It is read before the FLUSH below, so a run without the key fails without rotating the binary log:
-ENCRYPTION_KEY=$($GCP_BINARY_PATH secrets versions access latest --secret="$ENCRYPTION_KEY_SECRET") || {
-    echo -e "${RED}Error: Unable to read the encryption key $ENCRYPTION_KEY_SECRET from GCP Secret Manager.${RESET}"
+ENCRYPTION_KEY=$($GCP_BINARY_PATH secrets versions access latest --secret="$ENCRYPTION_KEY_SECRET" --impersonate-service-account="$ENCRYPTION_KEY_SERVICE_ACCOUNT") || {
+    echo -e "${RED}Error: Unable to read the encryption key $ENCRYPTION_KEY_SECRET from GCP Secret Manager as $ENCRYPTION_KEY_SERVICE_ACCOUNT.${RESET}"
     return 1; }
 
 # AES256 needs a key of exactly 32 characters (xbcrypt would fail with an invalid key length):

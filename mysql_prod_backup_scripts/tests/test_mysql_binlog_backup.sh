@@ -71,7 +71,8 @@ echo "${XBCRYPT_ENCRYPTION_KEY:-}" > "$T/key_seen"
 echo encrypted; cat
 EOF
 
-# Mock gcloud: secrets versions access latest --secret=NAME prints the key (KEY_FAIL fails it, KEY_VALUE replaces it).
+# Mock gcloud: secrets versions access latest --secret=NAME --impersonate-service-account=SA prints the key (KEY_FAIL fails it,
+# KEY_VALUE replaces it).
 # storage cp --if-generation-match=0 SRC gs://DST, into $T/bucket.
 # FAIL_ON=<file> fails that upload, HANG_ON=<file> hangs it, HANG_HARD_ON=<file> hangs it and ignores the stop signal.
 # The hang runs in a child process, like gcloud's own workers, to check that a survivor does not keep the lock.
@@ -79,6 +80,7 @@ cat > "$T/bin/gcloud" <<'EOF'
 #!/bin/bash
 if [ "$1 $2 $3 $4" = "secrets versions access latest" ]; then
     [ "$5" = "--secret=<ENCRYPT_KEY>" ] || { echo "mock gcloud: unexpected secret: $5" >&2; exit 2; }
+    [ "$6" = "--impersonate-service-account=<SERVICE_ACCOUNT>" ] || { echo "mock gcloud: unexpected service account: $6" >&2; exit 2; }
     [ -n "${KEY_FAIL:-}" ] && { echo "ERROR: (gcloud.secrets.versions.access) PERMISSION_DENIED: Permission denied" >&2; exit 1; }
     printf '%s\n' "${KEY_VALUE:-abcdefghijklmnopqrstuvwxyz012345}"
     exit 0
@@ -180,7 +182,7 @@ fi
 
 echo "--- encryption"
 rm -f "$TRACK"; server 200 201; run --init_binlog_chain mysql-bin.000200
-KEY_FAIL=1 run $C;                       check "secret not readable: the run fails without rotating the binlog" 1 "mysql-bin.000199" "Unable to read the encryption key <ENCRYPT_KEY> from GCP Secret Manager" '[ "$(tail -n 1 "$T/index")" = mysql-bin.000201 ] && [ "$(status_metric)" = 1 ]'
+KEY_FAIL=1 run $C;                       check "secret not readable: the run fails without rotating the binlog" 1 "mysql-bin.000199" "Unable to read the encryption key <ENCRYPT_KEY> from GCP Secret Manager as <SERVICE_ACCOUNT>" '[ "$(tail -n 1 "$T/index")" = mysql-bin.000201 ] && [ "$(status_metric)" = 1 ]'
 KEY_VALUE=short run $C;                  check "key of the wrong length: the run fails without rotating the binlog" 1 "mysql-bin.000199" "has 5 characters instead of 32" '[ "$(tail -n 1 "$T/index")" = mysql-bin.000201 ]'
 XBCRYPT_FAIL=1 run $C;                   check "xbcrypt fails: the run fails, tracking stays, no encrypted copy left" 1 "mysql-bin.000199" "Error encrypting binary log file: mysql-bin.000200" '[ -z "$(ls -A "$T/upload")" ]'
 FAIL_ON=mysql-bin.000200 run $C;         check "failed upload: the encrypted copy is deleted, the next run encrypts it again" 1 "mysql-bin.000199" "Error backing up binary log file: mysql-bin.000200" '[ -z "$(ls -A "$T/upload")" ]'

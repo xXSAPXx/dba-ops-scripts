@@ -106,13 +106,15 @@ for a in "$@"; do case "$a" in --encrypt-key-file=*) cat "${a#*=}" > "$T/key_see
 cat
 EOF
 
-# Mock gcloud: secrets versions access latest --secret=NAME prints the key (KEY_FAIL fails it, KEY_VALUE replaces it).
+# Mock gcloud: secrets versions access latest --secret=NAME --impersonate-service-account=SA prints the key (KEY_FAIL fails it,
+# KEY_VALUE replaces it).
 # storage cp SRC gs://DST, into $T/bucket. UPLOAD_FAIL fails it, UPLOAD_HANG hangs it, UPLOAD_HANG_HARD also ignores the stop signal.
 # The hang runs in a child process, like gcloud's own workers, to check that a survivor does not keep the run lock.
 cat > "$T/bin/gcloud" <<'EOF'
 #!/bin/bash
 if [ "$1 $2 $3 $4" = "secrets versions access latest" ]; then
     [ "$5" = "--secret=<ENCRYPT_KEY>" ] || { echo "mock gcloud: unexpected secret: $5" >&2; exit 2; }
+    [ "$6" = "--impersonate-service-account=<SERVICE_ACCOUNT>" ] || { echo "mock gcloud: unexpected service account: $6" >&2; exit 2; }
     [ -n "${KEY_FAIL:-}" ] && { echo "ERROR: (gcloud.secrets.versions.access) PERMISSION_DENIED: Permission denied" >&2; exit 1; }
     printf '%s\n' "${KEY_VALUE:-abcdefghijklmnopqrstuvwxyz012345}"
     exit 0
@@ -180,7 +182,7 @@ check "a full backup starts the incremental chain" - "Backup chain moved forward
 
 echo "--- the encryption key"
 fresh; KEY_FAIL=1 run --xtrabackup
-check "secret not readable: the backup does not start, lock released" 1 "Unable to read the encryption key <ENCRYPT_KEY> from GCP Secret Manager" '[ ! -e "$T/xtrabackup.args" ] && [ "$(metric node_mysql_backup_status)" = 1 ] && db_lock_released && no_key_left'
+check "secret not readable: the backup does not start, lock released" 1 "Unable to read the encryption key <ENCRYPT_KEY> from GCP Secret Manager as <SERVICE_ACCOUNT>" '[ ! -e "$T/xtrabackup.args" ] && [ "$(metric node_mysql_backup_status)" = 1 ] && db_lock_released && no_key_left'
 fresh; KEY_VALUE=short run --xtrabackup
 check "key of the wrong length: the backup does not start" 1 "has 5 characters instead of 32" '[ ! -e "$T/xtrabackup.args" ] && db_lock_released && no_key_left'
 

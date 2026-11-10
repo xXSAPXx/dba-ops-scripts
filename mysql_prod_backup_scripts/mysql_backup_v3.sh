@@ -7,8 +7,11 @@
 #  - GCP_BUCKET: the bucket and folder of this server's backups.
 #  - ENCRYPTION_KEY_SECRET: the GCP Secret Manager secret with the 32-character key. Keep the secret for as long as any backup
 #    encrypted with it: without the key those backups cannot be restored.
-#  - The server's service account: storage.objects.create, storage.objects.get and storage.objects.list on the bucket, secretmanager.versions.access on the secret.
-#    The VM's access scopes must also allow Cloud Storage and Secret Manager (the cloud-platform scope does).
+#  - ENCRYPTION_KEY_SERVICE_ACCOUNT: the service account gcloud impersonates to read the secret (--impersonate-service-account).
+#  - The server's service account: storage.objects.create, storage.objects.get and storage.objects.list on the bucket, and iam.serviceAccounts.getAccessToken
+#    on ENCRYPTION_KEY_SERVICE_ACCOUNT (roles/iam.serviceAccountTokenCreator), which has secretmanager.versions.access on the secret.
+#    The VM's access scopes must also allow Cloud Storage, Secret Manager and IAM credentials (the cloud-platform scope does), and the
+#    project needs the IAM Service Account Credentials API enabled.
 #  - Installed: Percona XtraBackup (8.4 for MySQL 8.4), the Google Cloud CLI (gcloud), and MySQL Shell for --mysql_shell (which also needs xbcrypt,
 #    part of XtraBackup).
 #  - MySQL login for a user with XtraBackup's privileges: mysql_config_editor set --login-path=local, or /root/.my.cnf.
@@ -83,11 +86,14 @@ LSN_DIR="/opt/scripts/mysql_backup.state"
 NEW_LSN_DIR="/opt/scripts/mysql_backup.state.new"
 # Empty if gcloud is not installed: main reports it once the log has started.
 GCP_BINARY_PATH=$(which gcloud 2>/dev/null)
-# Set the GCP bucket and folder of this server before the first run (the value below is the dev bucket):
-GCP_BUCKET="gs://db-dela-gamification-dev-src-backup"
+# Set the GCP bucket and folder of this server before the first run (the value below is a placeholder):
+GCP_BUCKET="gs://<BUCKET_NAME>"
 # The GCP Secret Manager secret with the encryption key (32 characters). Set the secret of this server before the first run
 # (the value below is a placeholder; the secret is in the same GCP project as this server). Without this key the backups cannot be restored:
 ENCRYPTION_KEY_SECRET="<ENCRYPT_KEY>"
+# The service account gcloud impersonates to read the secret (--impersonate-service-account), by its email. Set it before the
+# first run (the value below is a placeholder):
+ENCRYPTION_KEY_SERVICE_ACCOUNT="<SERVICE_ACCOUNT>"
 # Set by fetch_encryption_key for the duration of the backup:
 ENCRYPTION_KEY_FILE=""
 TEXTFILE_COLLECTOR_DIR="/var/lib/node_exporter/textfile_collector/"
@@ -220,8 +226,8 @@ fetch_encryption_key(){
     fi
 
     local ENCRYPTION_KEY
-    ENCRYPTION_KEY=$(${GCP_BINARY_PATH} secrets versions access latest --secret="$ENCRYPTION_KEY_SECRET") || {
-        echo -e "${RED}Error: Unable to read the encryption key $ENCRYPTION_KEY_SECRET from GCP Secret Manager.${RESET}"
+    ENCRYPTION_KEY=$(${GCP_BINARY_PATH} secrets versions access latest --secret="$ENCRYPTION_KEY_SECRET" --impersonate-service-account="$ENCRYPTION_KEY_SERVICE_ACCOUNT") || {
+        echo -e "${RED}Error: Unable to read the encryption key $ENCRYPTION_KEY_SECRET from GCP Secret Manager as $ENCRYPTION_KEY_SERVICE_ACCOUNT.${RESET}"
         return 1; }
 
     # AES256 needs a key of exactly 32 characters (xtrabackup would fail with an invalid key length):

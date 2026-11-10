@@ -19,9 +19,9 @@ if [ -z "$BACKUP_PATH" ]; then
     echo -e "${RED}╰┈➤ Error: Missing Xtrabackup file argument.${RESET}"
     echo "======================================================================================================================"
     echo
-    echo -e " ${CYAN}--Example Usage:${RESET}       | $0 gs://delasport-mysql-backup/2025-11-02-230001-dbfull.xbstream"
+    echo -e " ${CYAN}--Example Usage:${RESET}       | $0 gs://<BUCKET_NAME>/2025-11-02-230001-dbfull.xbstream"
     echo
-    echo -e " ${CYAN}--Check Latest Backup:${RESET} | gcloud storage ls -l gs://delasport-mysql-backup/"
+    echo -e " ${CYAN}--Check Latest Backup:${RESET} | gcloud storage ls -l gs://<BUCKET_NAME>/"
     echo
     echo "======================================================================================================================"
     exit 1

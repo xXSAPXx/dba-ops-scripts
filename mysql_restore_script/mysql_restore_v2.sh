@@ -7,8 +7,11 @@
 #  - GCP_BUCKET: the bucket and folder of the backups to restore.
 #  - BINLOG_GCP_BUCKET: the bucket and folder of the binlog backups (mysql_binlog_backup_v2.sh), to fetch binlogs.
 #  - ENCRYPTION_KEY_SECRET: the GCP Secret Manager secret the backups were encrypted with.
-#  - The server's service account: storage.objects.get and storage.objects.list on the bucket, secretmanager.versions.access on the secret.
-#    The VM's access scopes must also allow Cloud Storage and Secret Manager (the cloud-platform scope does).
+#  - ENCRYPTION_KEY_SERVICE_ACCOUNT: the service account gcloud impersonates to read the secret (--impersonate-service-account).
+#  - The server's service account: storage.objects.get and storage.objects.list on the bucket, and iam.serviceAccounts.getAccessToken on
+#    ENCRYPTION_KEY_SERVICE_ACCOUNT (roles/iam.serviceAccountTokenCreator), which has secretmanager.versions.access on the secret.
+#    The VM's access scopes must also allow Cloud Storage, Secret Manager and IAM credentials (the cloud-platform scope does), and the
+#    project needs the IAM Service Account Credentials API enabled.
 #  - Installed: Percona XtraBackup for the MySQL version of the backups (8.4 for MySQL 8.4), and the Google Cloud CLI (gcloud). To replay binlogs: mysqlbinlog and mysql.
 #  - DATA_DIR: this server's datadir, on a disk with room for the whole database (decompressed). MySQL runs as the systemd service mysqld.
 #  - The mysqld service starts mysqld with $MYSQLD_OPTS (Percona's does), and /etc/sysconfig/mysql does not set MYSQLD_OPTS: the script starts MySQL closed with it.
@@ -70,11 +73,14 @@ RESET="\e[0m"
 LOG_FILE="/opt/restore_script.log"
 
 # === Settings ===
-# Set the GCP bucket and folder of the backups before the first run (the value below is the dev bucket):
-GCP_BUCKET="gs://db-dela-gamification-dev-src-backup"
+# Set the GCP bucket and folder of the backups before the first run (the value below is a placeholder):
+GCP_BUCKET="gs://<BUCKET_NAME>"
 # The GCP Secret Manager secret with the encryption key of the backups (32 characters): the secret of the server the backups came from,
 # in the same GCP project as that server (the value below is a placeholder):
 ENCRYPTION_KEY_SECRET="<ENCRYPT_KEY>"
+# The service account gcloud impersonates to read that secret (--impersonate-service-account), by its email (the value below is
+# a placeholder):
+ENCRYPTION_KEY_SERVICE_ACCOUNT="<SERVICE_ACCOUNT>"
 DATA_DIR="/var/lib/mysql"
 # Each incremental backup is extracted here, applied to DATA_DIR, and deleted before the next one:
 INCREMENTAL_DIR="/backup/restore_incremental"
@@ -240,8 +246,8 @@ fi
 # a command line (ps shows those to every user) and is never printed. The trap removes it however the script ends:
 KEY_FILE=$(mktemp -p /dev/shm mysql_restore_key.XXXXXX) || fail "Unable to create the encryption key file on the RAM disk /dev/shm."
 trap 'rm -f "$KEY_FILE"' EXIT
-ENCRYPTION_KEY=$(gcloud secrets versions access latest --secret="$ENCRYPTION_KEY_SECRET") || \
-    fail "Unable to read the encryption key $ENCRYPTION_KEY_SECRET from GCP Secret Manager."
+ENCRYPTION_KEY=$(gcloud secrets versions access latest --secret="$ENCRYPTION_KEY_SECRET" --impersonate-service-account="$ENCRYPTION_KEY_SERVICE_ACCOUNT") || \
+    fail "Unable to read the encryption key $ENCRYPTION_KEY_SECRET from GCP Secret Manager as $ENCRYPTION_KEY_SERVICE_ACCOUNT."
 [ ${#ENCRYPTION_KEY} -eq 32 ] || fail "The encryption key $ENCRYPTION_KEY_SECRET has ${#ENCRYPTION_KEY} characters instead of 32."
 printf '%s' "$ENCRYPTION_KEY" > "$KEY_FILE"
 unset ENCRYPTION_KEY
