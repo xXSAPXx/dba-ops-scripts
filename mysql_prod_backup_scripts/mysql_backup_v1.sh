@@ -23,7 +23,7 @@ DATA_DIR="/var/lib/mysql"
 BACKUP_DIR="/backup"
 BACKUP_DIR_SHELL="${BACKUP_DIR}/full-instance-backup-${CURRENT_TIME}-mysql-shell/"
 GCP_BINARY_PATH=$(which gcloud) || { echo -e "${RED}Error: gcloud CLI is not installed or not in PATH. Please install Google Cloud SDK.${RESET}"; }
-GCP_BUCKET="gs://db-dela-gamification-stg-src-backup"
+GCP_BUCKET="gs://<BUCKET_NAME>"
 TEXTFILE_COLLECTOR_DIR="/var/lib/node_exporter/textfile_collector/"
 BACKUP_TIMESTAMP=$(($(date +%s) * 1000))
 
