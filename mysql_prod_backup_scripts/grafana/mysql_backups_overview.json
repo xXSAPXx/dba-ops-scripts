@@ -88,7 +88,7 @@
         "type": "prometheus",
         "uid": "${DS_LAB}"
       },
-      "description": "Time since the start of the last full backup that reached the bucket, on the VM where it is oldest. Fulls run on Monday and Thursday, so up to 96 h is normal: amber from 108 h, red from 120 h.",
+      "description": "Time since the start of the last full backup that reached the bucket, on the VM where it is oldest. Fulls run on Monday and Friday, so up to 96 h is normal: amber from 108 h, red from 120 h.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1632,7 +1632,7 @@
         "type": "prometheus",
         "uid": "${DS_FAKE}"
       },
-      "description": "Time since the start of the last full backup that reached the bucket, on the VM where it is oldest. Fulls run on Monday and Thursday, so up to 96 h is normal: amber from 108 h, red from 120 h.",
+      "description": "Time since the start of the last full backup that reached the bucket, on the VM where it is oldest. Fulls run on Monday and Friday, so up to 96 h is normal: amber from 108 h, red from 120 h.",
       "fieldConfig": {
         "defaults": {
           "color": {

@@ -23,7 +23,7 @@
 #  - The cron entries in /etc/cron.d/mysql_backup (example in 7).
 #
 # Decide:
-#  - The schedule: how often a full backup, with incremental backups on the other days (example in 7: fulls on Monday and Thursday).
+#  - The schedule: how often a full backup, with incremental backups on the other days (example in 7: fulls on Monday and Friday).
 #  - The retention: N days of restore points need a bucket lifecycle rule of N + 4 days, for these backups and the binlogs (see 9).
 #  - The alerts: node_mysql_backup_* (with two fulls a week, the full backup's age reaches 4 days), node_mysql_incremental_backup_*
 #    and node_mysql_shell_backup_* (MySQL Shell, on its own schedule).
@@ -49,9 +49,9 @@ ulimit -c 0
 # 7) Logs every backup run (normal execution and errors, with colors) to /var/log/mysql/mysql_backup.log. Before the script runs from cron,
 #    install its rotation: cp mysql_backup.logrotate.example /etc/logrotate.d/mysql_backup (the log grows without it).
 #    The script logs itself, so cron's copy of the output goes to /dev/null, e.g. in /etc/cron.d/mysql_backup (full backups on Monday
-#    and Thursday, incremental backups on the other days):
-#    0 2 * * 1,4 root /opt/scripts/mysql_backup_v3.sh --xtrabackup > /dev/null 2>&1
-#    0 2 * * 0,2,3,5,6 root /opt/scripts/mysql_backup_v3.sh --xtrabackup_incremental > /dev/null 2>&1
+#    and Friday, incremental backups on the other days):
+#    0 2 * * 1,5 root /opt/scripts/mysql_backup_v3.sh --xtrabackup > /dev/null 2>&1
+#    0 2 * * 0,2,3,4,6 root /opt/scripts/mysql_backup_v3.sh --xtrabackup_incremental > /dev/null 2>&1
 # 8) Encrypts the XtraBackup backups and the MySQL Shell archives (AES256) with a key read from GCP Secret Manager. The key is kept on the
 #    RAM disk (/dev/shm) for the backup only, and never printed. To restore: xbstream -x < <backup>.xbstream, then
 #    xtrabackup --decrypt=AES256 --encrypt-key-file=<file with the key> --decompress --remove-original --target-dir=<dir>, then --prepare.
@@ -62,7 +62,7 @@ ulimit -c 0
 #    of the chain as in 8), then xtrabackup --prepare --apply-log-only --target-dir=<full>, then for each incremental in order
 #    xtrabackup --prepare --apply-log-only --target-dir=<full> --incremental-dir=<incremental> (the last one without --apply-log-only).
 #    Bucket retention: to restore any moment of the last N days, keep every backup N + 4 days. A restore point can need a full backup
-#    up to 4 days older than itself (Thursday's full, then three incrementals and a day of binlogs).
+#    up to 4 days older than itself (Monday's full, then three incrementals and a day of binlogs).
 
 
 # Colors for output:

@@ -94,34 +94,34 @@ If the script is interrupted during a backup, a trap deletes the key file and re
 ```mermaid
 flowchart LR
     subgraph CHAIN1 ["Chain 1"]
-        MON["Mon<br/>full"] --> TUE["Tue<br/>incremental"] --> WED["Wed<br/>incremental"]
+        MON["Mon<br/>full"] --> TUE["Tue<br/>incremental"] --> WED["Wed<br/>incremental"] --> THU["Thu<br/>incremental"]
     end
     subgraph CHAIN2 ["Chain 2"]
-        THU["Thu<br/>full"] --> FRI["Fri<br/>incremental"] --> SAT["Sat<br/>incremental"] --> SUN["Sun<br/>incremental"]
+        FRI["Fri<br/>full"] --> SAT["Sat<br/>incremental"] --> SUN["Sun<br/>incremental"]
     end
-    WED ~~~ THU
+    THU ~~~ FRI
 ```
 
 - Each incremental holds only the pages changed since the backup before it. After its upload, a backup's position (`xtrabackup_checkpoints`) becomes the **chain state** in `/opt/scripts/mysql_backup.state`: the base of the next incremental.
 - A failed backup or upload leaves the chain state on the last backup in the bucket, so the next incremental continues from there: the chain has no holes.
-- A full backup starts a new chain. [The cron example](#cron) takes fulls on Monday and Thursday, and incrementals on the other days.
-- To restore Saturday: Thursday's full, then Friday's and Saturday's incrementals, in this order. [`mysql_restore_v2.sh`](../mysql_restore_script/mysql_restore_v2.sh) (AWS: [`mysql_restore_v2_aws.sh`](../mysql_restore_script/mysql_restore_v2_aws.sh)) does this. It also deletes the chain state, because an incremental taken on top of the old chain after a restore would miss changes without any error. Incrementals then fail until a full backup starts a new chain. It deletes the binlog chain state as well, for the same reason (see [the binlog workflow](mysql_binlog_backup_workflow.md)).
+- A full backup starts a new chain. [The cron example](#cron) takes fulls on Monday and Friday, and incrementals on the other days.
+- To restore Sunday: Friday's full, then Saturday's and Sunday's incrementals, in this order. [`mysql_restore_v2.sh`](../mysql_restore_script/mysql_restore_v2.sh) (AWS: [`mysql_restore_v2_aws.sh`](../mysql_restore_script/mysql_restore_v2_aws.sh)) does this. It also deletes the chain state, because an incremental taken on top of the old chain after a restore would miss changes without any error. Incrementals then fail until a full backup starts a new chain. It deletes the binlog chain state as well, for the same reason (see [the binlog workflow](mysql_binlog_backup_workflow.md)).
 - After the restore, MySQL is closed to clients until a person runs `systemctl restart mysqld`, so nothing can write before the checks or a binlog replay.
 - For a moment later than the backup: `--fetch_binlogs <server>` in the restore script fetches the binlogs from the position the data reached and prints how to replay them. A DBA replays them by hand, up to the chosen moment. [The restore workflow](../mysql_restore_script/mysql_restore_workflow.md) has the steps.
-- Retention: to restore any moment of the last N days, keep every backup N + 4 days. A restore point can need a full backup up to 4 days older than itself (Thursday's full, three incrementals and a day of binlogs).
+- Retention: to restore any moment of the last N days, keep every backup N + 4 days. A restore point can need a full backup up to 4 days older than itself (Monday's full, three incrementals and a day of binlogs).
 
 ## Cron
 
-`/etc/cron.d/mysql_backup`, for fulls on Monday and Thursday and incrementals on the other days (on AWS, `mysql_backup_v3_aws.sh`):
+`/etc/cron.d/mysql_backup`, for fulls on Monday and Friday and incrementals on the other days (on AWS, `mysql_backup_v3_aws.sh`):
 
 ```
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-0 2 * * 1,4 root /opt/scripts/mysql_backup_v3.sh --xtrabackup > /dev/null 2>&1
-0 2 * * 0,2,3,5,6 root /opt/scripts/mysql_backup_v3.sh --xtrabackup_incremental > /dev/null 2>&1
+0 2 * * 1,5 root /opt/scripts/mysql_backup_v3.sh --xtrabackup > /dev/null 2>&1
+0 2 * * 0,2,3,4,6 root /opt/scripts/mysql_backup_v3.sh --xtrabackup_incremental > /dev/null 2>&1
 ```
 
 - **`PATH`:** cron's own is short, and the script finds the cloud CLI with `which`. Without it, a CLI in `/usr/local/bin` looks not installed and the backup fails.
-- **Take the first full by hand before enabling it:** `/opt/scripts/mysql_backup_v3.sh --xtrabackup`. Otherwise every incremental fails with "No base" until the next Monday or Thursday.
+- **Take the first full by hand before enabling it:** `/opt/scripts/mysql_backup_v3.sh --xtrabackup`. Otherwise every incremental fails with "No base" until the next Monday or Friday.
 - **The output:** the script logs itself to `/var/log/mysql/mysql_backup.log`, so cron's copy goes to `/dev/null`.
 - **The file:** owned by root, mode 644, ending with a new line, and with no dot in its name, or cron ignores it. The script needs `chmod 700`.
 - **The time:** the server's local time.
