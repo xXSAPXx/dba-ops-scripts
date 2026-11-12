@@ -87,6 +87,10 @@ LSN_DIR="/opt/scripts/mysql_backup.state"
 NEW_LSN_DIR="/opt/scripts/mysql_backup.state.new"
 # Empty if gcloud is not installed: main reports it once the log has started.
 GCP_BINARY_PATH=$(which gcloud 2>/dev/null)
+# Parallel composite uploads, gcloud's default for files of 150 MiB or more: much faster for a full backup. Set here to make the choice
+# visible and to keep gcloud's warning out of the log. A stopped upload leaves temporary objects in the bucket under
+# gcloud/tmp/parallel_composite_uploads/. The binlog script uses plain uploads (see mysql_binlog_backup_v2.sh):
+export CLOUDSDK_STORAGE_PARALLEL_COMPOSITE_UPLOAD_ENABLED=True
 # Set the GCP bucket and folder of this server before the first run (the value below is a placeholder):
 GCP_BUCKET="gs://<BUCKET_NAME>"
 # The GCP Secret Manager secret with the encryption key (32 characters). Set the secret of this server before the first run

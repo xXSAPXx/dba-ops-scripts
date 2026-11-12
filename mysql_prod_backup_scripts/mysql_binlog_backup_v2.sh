@@ -65,8 +65,8 @@ GCP_BINARY_PATH=$(which gcloud) || { echo -e "${RED}Error: gcloud CLI is not ins
 # 32 temporary objects in the bucket and composes them into one object, with a warning in the log. A binary log (max_binlog_size,
 # 1 GiB by default) is small enough to upload plainly, and it is uploaded every few minutes: composing each one would leave its
 # temporary objects in the bucket when an upload is stopped (UPLOAD_TIMEOUT), soft delete on the bucket would keep and bill the deleted
-# ones, and the composed object has no MD5 hash. The full backups keep gcloud's default (mysql_backup_v3.sh): there the speed matters.
-# The environment variable overrides gcloud's own configuration, for this script only:
+# ones, and the composed object has no MD5 hash. The full backups use parallel composite uploads (mysql_backup_v3.sh): there the
+# speed matters. The environment variable overrides gcloud's own configuration, for this script only:
 export CLOUDSDK_STORAGE_PARALLEL_COMPOSITE_UPLOAD_ENABLED=False
 # Set the GCP bucket and folder of this server before the first run (the value below is a placeholder).
 # Binlogs go to <bucket>/<folder>/<server name>/<date>/:
