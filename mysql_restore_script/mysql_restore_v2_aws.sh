@@ -66,7 +66,7 @@ YELLOW="\e[33m"
 RESET="\e[0m"
 
 # === Log file ===
-LOG_FILE="/opt/restore_script.log"
+LOG_FILE="/var/log/mysql/mysql_restore.log"
 
 # === Settings ===
 # Set the S3 bucket and folder of the backups before the first run (in the aws-dba-labs lab: terraform output backup_s3_prefix):

@@ -9,7 +9,7 @@ YELLOW="\e[33m"
 RESET="\e[0m"
 
 # === Log file ===
-LOG_FILE="/opt/restore_script.log"
+LOG_FILE="/var/log/mysql/mysql_restore.log"
 
 # === Backup argument check ===
 BACKUP_PATH="${1:-}"

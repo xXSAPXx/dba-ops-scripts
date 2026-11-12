@@ -34,7 +34,7 @@ Red: the run ends with the metrics set to failed and exit 1. A failed MySQL comm
 ```mermaid
 %%{init: {"flowchart": {"wrappingWidth": 400}}}%%
 flowchart TD
-    START(["cron runs<br/>--continuous_binlog_backup"]) --> LOG["Start the log<br/>/var/log/mysql_binlog_backup.log"]
+    START(["cron runs<br/>--continuous_binlog_backup"]) --> LOG["Start the log<br/>/var/log/mysql/mysql_binlog_backup.log"]
     LOG --> RUNLOCK{"Run lock free?"}
     RUNLOCK -->|"no: the last run is still uploading"| SKIP["Skip this run, exit 0<br/>metrics untouched"]
     RUNLOCK -->|"yes"| STATE{"Chain state exists<br/>and holds a binlog name?"}
@@ -86,7 +86,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 - **`PATH`:** cron's own is short, and the script finds the cloud CLI with `which`. Without it, a CLI in `/usr/local/bin` looks not installed and the backup fails.
 - **Start the chain by hand before enabling it:** `--init_binlog_chain mysql-bin.NNNNNN` (`--help` shows which binlog). Otherwise every run fails with "No binlog chain to continue".
 - **How often:** every 15-30 minutes. The binlogs of that time, and the active one, are not in the bucket yet, so this is how much a lost server can lose.
-- **The output:** the script logs itself to `/var/log/mysql_binlog_backup.log`, so cron's copy goes to `/dev/null`.
+- **The output:** the script logs itself to `/var/log/mysql/mysql_binlog_backup.log`, so cron's copy goes to `/dev/null`.
 - **The file:** owned by root, mode 644, ending with a new line, and with no dot in its name, or cron ignores it. The script needs `chmod 700`.
 - **A slow upload:** a run that finds the last one still uploading skips with exit 0, so it never piles up.
 
@@ -97,5 +97,5 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 | Bucket | `SERVER/DATE/mysql-bin.NNNNNN.xbcrypt` (encrypted) |
 | `/backup/binlog_upload` | One encrypted binlog during its upload, deleted after it |
 | `/opt/scripts/mysql_binlog_backup.state` | The chain state: the last binlog in the bucket |
-| `/var/log/mysql_binlog_backup.log` | Every run, with colors (`less -R`) |
+| `/var/log/mysql/mysql_binlog_backup.log` | Every run, with colors (`less -R`) |
 | node_exporter textfile folder | `node_mysql_binlog_backup_status` (0 ok, 1 failed), `node_mysql_binlog_backup_duration_seconds`, `node_mysql_current_active_binlog`, `node_mysql_last_backed_up_binlog`, `node_mysql_last_successful_binlog_backup_date` |
