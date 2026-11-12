@@ -18,7 +18,7 @@ Red: the run ends with exit 1.
 flowchart TD
     START(["cron or a person runs<br/>the script with one option"]) --> ARGS{"One valid option?"}
     ARGS -->|"no, or --help"| HELP["Print the help"]
-    ARGS -->|"yes"| LOG["Start the log<br/>/var/log/mysql_backup.log"]
+    ARGS -->|"yes"| LOG["Start the log<br/>/var/log/mysql/mysql_backup.log"]
     LOG --> RUNLOCK{"Run lock free?<br/>(one backup at a time)"}
     RUNLOCK -->|"no: a backup still runs"| BUSY["Exit 1<br/>metrics untouched"]:::fail
     RUNLOCK -->|"yes"| BACKUP["Take the backup<br/>(diagram 2)"]
@@ -122,7 +122,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 - **`PATH`:** cron's own is short, and the script finds the cloud CLI with `which`. Without it, a CLI in `/usr/local/bin` looks not installed and the backup fails.
 - **Take the first full by hand before enabling it:** `/opt/scripts/mysql_backup_v3.sh --xtrabackup`. Otherwise every incremental fails with "No base" until the next Monday or Thursday.
-- **The output:** the script logs itself to `/var/log/mysql_backup.log`, so cron's copy goes to `/dev/null`.
+- **The output:** the script logs itself to `/var/log/mysql/mysql_backup.log`, so cron's copy goes to `/dev/null`.
 - **The file:** owned by root, mode 644, ending with a new line, and with no dot in its name, or cron ignores it. The script needs `chmod 700`.
 - **The time:** the server's local time.
 - **Long backups:** a run that finds another still running fails, with its metrics untouched. A full that takes over 24 hours makes the next incremental fail.
@@ -137,5 +137,5 @@ The binlogs have [their own cron file](mysql_binlog_backup_workflow.md#cron).
 | Bucket | `TIME-dbfull.xbstream`, `TIME-dbincr.xbstream` and `full-instance-backup-TIME.tar.xbcrypt` (MySQL Shell), all encrypted |
 | `/backup` | Recent backups for a quick restore: XtraBackup files are deleted after 23 hours, MySQL Shell archives after 3 days, and the MySQL Shell dump folder (not encrypted) after a day or two. Incrementals are deleted right after their upload. |
 | `/opt/scripts/mysql_backup.state` | The chain state: the position of the last backup in the bucket |
-| `/var/log/mysql_backup.log` | Every run, with colors (`less -R`) |
+| `/var/log/mysql/mysql_backup.log` | Every run, with colors (`less -R`) |
 | node_exporter textfile folder | `node_mysql_backup_*` (XtraBackup fulls), `node_mysql_incremental_backup_*` and `node_mysql_shell_backup_*` (MySQL Shell): status, durations, backup size (`_size_bytes`, after a successful backup), time of the last success |

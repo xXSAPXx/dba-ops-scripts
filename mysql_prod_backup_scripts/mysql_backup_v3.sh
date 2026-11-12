@@ -18,7 +18,8 @@
 #  - BACKUP_DIR (/backup): a disk with room for one full backup and one incremental backup (compressed).
 #  - /opt/scripts: the scripts, and the incremental backup chain's state folder (LSN_DIR).
 #  - node_exporter reads TEXTFILE_COLLECTOR_DIR (--collector.textfile.directory), for the backup metrics.
-#  - The log rotation: cp mysql_backup.logrotate.example /etc/logrotate.d/mysql_backup
+#  - The log folder /var/log/mysql (MySQL's own: the log is not written without it) and the log rotation:
+#    cp mysql_backup.logrotate.example /etc/logrotate.d/mysql_backup
 #  - The cron entries in /etc/cron.d/mysql_backup (example in 7).
 #
 # Decide:
@@ -45,7 +46,7 @@ ulimit -c 0
 # 4) Transfers the backup to a GCP bucket, with a time limit (UPLOAD_TIMEOUT). gcloud takes its credentials from the server's service account.
 # 5) Updates node_exporter text collector files for Grafana backup monitoring in case of SUCCESS or FAILURE.
 # 6) Backups can be performed LOCALLY by both utilities if needed.
-# 7) Logs every backup run (normal execution and errors, with colors) to /var/log/mysql_backup.log. Before the script runs from cron,
+# 7) Logs every backup run (normal execution and errors, with colors) to /var/log/mysql/mysql_backup.log. Before the script runs from cron,
 #    install its rotation: cp mysql_backup.logrotate.example /etc/logrotate.d/mysql_backup (the log grows without it).
 #    The script logs itself, so cron's copy of the output goes to /dev/null, e.g. in /etc/cron.d/mysql_backup (full backups on Monday
 #    and Thursday, incremental backups on the other days):
@@ -102,7 +103,7 @@ TEXTFILE_COLLECTOR_DIR="/var/lib/node_exporter/textfile_collector/"
 # mysql_incremental_backup_status.prom:
 METRICS_NAME="backup"
 LOCK_FILE="/var/lock/mysql_backup.lock"
-LOG_FILE="/var/log/mysql_backup.log"
+LOG_FILE="/var/log/mysql/mysql_backup.log"
 # An upload that takes longer is stopped and the transfer fails. Keep it well above the slowest normal upload (node_mysql_backup_transfer_duration_seconds):
 UPLOAD_TIMEOUT="12h"
 BACKUP_TIMESTAMP=$(($(date +%s) * 1000))

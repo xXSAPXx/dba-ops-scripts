@@ -19,7 +19,7 @@ Red: the run ends with exit 1, and MySQL has not been touched.
 flowchart TD
     START(["A person runs the script"]) --> ARGS{"Enough arguments?"}
     ARGS -->|"no"| USAGE["Print the usage"]:::fail
-    ARGS -->|"yes"| LOG["Start the log /opt/restore_script.log<br/>(replaced on every run)"]
+    ARGS -->|"yes"| LOG["Start the log /var/log/mysql/mysql_restore.log<br/>(replaced on every run)"]
     LOG --> WHICH{"What was given?"}
     WHICH -->|"a full backup and<br/>its incrementals"| XCHECK["Check: the tools, the names,<br/>their time order, all in the bucket"]
     WHICH -->|"--fetch_binlogs server"| BCHECK["Check: the tools, an XtraBackup restore in the datadir,<br/>no folder from an earlier fetch,<br/>one unbroken binlog sequence in the bucket"]
@@ -206,5 +206,5 @@ mv /root/mysql_backup /root/mysql_binlog_backup /etc/cron.d/
 | `/backup/restore_binlogs` | The fetched binlogs, **not encrypted**, readable by root only. A DBA deletes them. |
 | `/backup/restore_shell` | The unpacked MySQL Shell dump, **not encrypted**, readable by root only. A DBA deletes it. |
 | `/dev/shm/mysql_restore_key.*` | The key file, readable by root only, for the run only |
-| `/opt/restore_script.log` | The last run, with colors (`less -R`). Each run replaces it, so `--fetch_binlogs` replaces the restore's log. |
+| `/var/log/mysql/mysql_restore.log` | The last run, with colors (`less -R`). Each run replaces it, so `--fetch_binlogs` replaces the restore's log. |
 | Deleted | `/opt/scripts/mysql_backup.state` and `/opt/scripts/mysql_binlog_backup.state`: the two chain states |

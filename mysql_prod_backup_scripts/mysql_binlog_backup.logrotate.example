@@ -1,4 +1,4 @@
-/var/log/mysql_binlog_backup.log {
+/var/log/mysql/mysql_binlog_backup.log {
     size 10M
     rotate 4
     compress

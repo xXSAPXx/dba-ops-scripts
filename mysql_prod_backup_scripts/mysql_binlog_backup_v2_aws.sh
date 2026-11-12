@@ -15,7 +15,8 @@
 #  - ENCRYPTED_BINLOG_DIR (/backup/binlog_upload): room for one encrypted binary log (max_binlog_size).
 #  - /opt/scripts: the scripts, and the binlog chain's tracking file (LAST_BINLOG_BACKUP_FILE).
 #  - node_exporter reads TEXTFILE_COLLECTOR_DIR (--collector.textfile.directory), for the binlog backup metrics.
-#  - The log rotation: cp mysql_binlog_backup.logrotate.example /etc/logrotate.d/mysql_binlog_backup
+#  - The log folder /var/log/mysql (MySQL's own: the log is not written without it) and the log rotation:
+#    cp mysql_binlog_backup.logrotate.example /etc/logrotate.d/mysql_binlog_backup
 #  - The chain, started once by hand: --init_binlog_chain <binary log> (--help shows which one), then the cron entry for
 #    --continuous_binlog_backup.
 #
@@ -37,7 +38,7 @@ ulimit -c 0
 # The script is used to backup MySQL binlog files to Amazon S3:
 # A person starts a binlog chain once with --init_binlog_chain, then cron runs --continuous_binlog_backup every 15-30 minutes.
 # It writes binlog backup metrics in /node_exporter/textfile_collector/ to be scraped by Prometheus.
-# It logs every run (normal execution and errors, with colors) to /var/log/mysql_binlog_backup.log. Before the script runs from cron,
+# It logs every run (normal execution and errors, with colors) to /var/log/mysql/mysql_binlog_backup.log. Before the script runs from cron,
 # install its rotation: cp mysql_binlog_backup.logrotate.example /etc/logrotate.d/mysql_binlog_backup (the log grows without it).
 # It encrypts every binary log (xbcrypt, AES256) before the upload, with a key read from AWS Secrets Manager: the bucket holds only
 # <binary log>.xbcrypt files. To decrypt one: XBCRYPT_ENCRYPTION_KEY=<key> xbcrypt --decrypt --encrypt-algo=AES256 < <file>.xbcrypt > <file>
@@ -68,7 +69,7 @@ ENCRYPTED_BINLOG_DIR="/backup/binlog_upload"
 SERVER_NAME=$(hostname -s)
 TEXTFILE_COLLECTOR_DIR="/var/lib/node_exporter/textfile_collector/"
 LOCK_FILE="/var/lock/mysql_binlog_backup.lock"
-LOG_FILE="/var/log/mysql_binlog_backup.log"
+LOG_FILE="/var/log/mysql/mysql_binlog_backup.log"
 # An upload of one binary log that takes longer is stopped, and the next run retries it. Keep it well above the slowest normal upload (max_binlog_size):
 UPLOAD_TIMEOUT="30m"
 BACKUP_TIMESTAMP=$(($(date +%s) * 1000))
