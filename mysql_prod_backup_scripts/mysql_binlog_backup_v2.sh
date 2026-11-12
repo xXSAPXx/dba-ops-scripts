@@ -61,6 +61,13 @@ DATA_DIR="/var/lib/mysql"
 # The tracking file of the binlog chain: the last binary log uploaded to the bucket. Delete it only to start a new chain (see --help):
 LAST_BINLOG_BACKUP_FILE="/opt/scripts/mysql_binlog_backup.state"
 GCP_BINARY_PATH=$(which gcloud) || { echo -e "${RED}Error: gcloud CLI is not installed or not in PATH. Please install Google Cloud SDK.${RESET}"; }
+# Plain uploads for the binary logs, never parallel composite uploads. By default gcloud splits a file of 150 MiB or more into up to
+# 32 temporary objects in the bucket and composes them into one object, with a warning in the log. A binary log (max_binlog_size,
+# 1 GiB by default) is small enough to upload plainly, and it is uploaded every few minutes: composing each one would leave its
+# temporary objects in the bucket when an upload is stopped (UPLOAD_TIMEOUT), soft delete on the bucket would keep and bill the deleted
+# ones, and the composed object has no MD5 hash. The full backups use parallel composite uploads (mysql_backup_v3.sh): there the
+# speed matters. The environment variable overrides gcloud's own configuration, for this script only:
+export CLOUDSDK_STORAGE_PARALLEL_COMPOSITE_UPLOAD_ENABLED=False
 # Set the GCP bucket and folder of this server before the first run (the value below is a placeholder).
 # Binlogs go to <bucket>/<folder>/<server name>/<date>/:
 GCS_BUCKET="gs://<BUCKET_NAME>/binlog_backups"

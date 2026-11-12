@@ -73,7 +73,7 @@ EOF
 
 # Mock gcloud: secrets versions access latest --secret=NAME --impersonate-service-account=SA prints the key (KEY_FAIL fails it,
 # KEY_VALUE replaces it).
-# storage cp --if-generation-match=0 SRC gs://DST, into $T/bucket.
+# storage cp --if-generation-match=0 SRC gs://DST, into $T/bucket, only with parallel composite uploads switched off.
 # FAIL_ON=<file> fails that upload, HANG_ON=<file> hangs it, HANG_HARD_ON=<file> hangs it and ignores the stop signal.
 # The hang runs in a child process, like gcloud's own workers, to check that a survivor does not keep the lock.
 cat > "$T/bin/gcloud" <<'EOF'
@@ -86,6 +86,7 @@ if [ "$1 $2 $3 $4" = "secrets versions access latest" ]; then
     exit 0
 fi
 [ "$1 $2 $3" = "storage cp --if-generation-match=0" ] || { echo "mock gcloud: unexpected arguments: $*" >&2; exit 2; }
+[ "${CLOUDSDK_STORAGE_PARALLEL_COMPOSITE_UPLOAD_ENABLED:-}" = False ] || { echo "mock gcloud: parallel composite uploads are not switched off" >&2; exit 2; }
 src="$4"; dst="$T/bucket/${5#gs://}"; name=$(basename "$src" .xbcrypt)
 [ "${FAIL_ON:-}" = "$name" ] && { echo "ERROR: (gcloud.storage.cp) HTTPError 503: Service unavailable" >&2; exit 1; }
 [ "${HANG_ON:-}" = "$name" ] && { sleep 600 & echo $! >> "$T/hung.pids"; wait; }
