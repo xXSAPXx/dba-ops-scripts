@@ -19,10 +19,10 @@ Red: the run ends with exit 1, and MySQL has not been touched.
 flowchart TD
     START(["A person runs the script"]) --> ARGS{"Enough arguments?"}
     ARGS -->|"no"| USAGE["Print the usage"]:::fail
-    ARGS -->|"yes"| LOG["Start the log /var/log/mysql/mysql_restore.log<br/>(replaced on every run)"]
+    ARGS -->|"yes"| LOG["Start the log /var/log/mysql/mysql_restore.log, with a header line:<br/>a new log for a restore or a MySQL Shell fetch,<br/>the bottom of the restore's log for --fetch_binlogs"]
     LOG --> WHICH{"What was given?"}
     WHICH -->|"a full backup and<br/>its incrementals"| XCHECK["Check: the tools, the names,<br/>their time order, all in the bucket"]
-    WHICH -->|"--fetch_binlogs server"| BCHECK["Check: the tools, an XtraBackup restore in the datadir,<br/>no folder from an earlier fetch,<br/>one unbroken binlog sequence in the bucket"]
+    WHICH -->|"--fetch_binlogs server"| BCHECK["Check: the tools, an XtraBackup restore in the datadir,<br/>no folder from an earlier fetch.<br/>Print where the replay starts: binlog, position, backup end, GTIDs.<br/>Check: one unbroken binlog sequence in the bucket"]
     WHICH -->|"a MySQL Shell archive"| SCHECK["Check: given alone, xbcrypt,<br/>no folder from an earlier fetch, in the bucket"]
     XCHECK -->|"failed"| F1["Fail"]:::fail
     BCHECK -->|"failed"| F2["Fail"]:::fail
@@ -53,12 +53,12 @@ flowchart TD
     WIPE --> STATES["Delete both chain states:<br/>incremental and binlog"]
     STATES --> FULL["Full backup: stream from the bucket, decrypted and<br/>decompressed on the way (xbstream), into the datadir"]
     FULL --> PREP["Prepare (--use-memory=PREPARE_MEMORY),<br/>with --apply-log-only if incrementals follow"]
-    PREP --> POS1["Print the binlog position it reached"]
+    PREP --> POS1["Print how long it took (fetch + extract, prepare)<br/>and the binlog position it reached"]
     POS1 --> MORE{"Another incremental?"}
     MORE -->|"yes"| INC["Stream it into INCREMENTAL_DIR, decrypted and decompressed"]
     INC --> APPLY["Apply it to the datadir,<br/>with --apply-log-only unless it is the last"]
     APPLY --> RMINC["Delete INCREMENTAL_DIR"]
-    RMINC --> POS2["Print the binlog position it reached"]
+    RMINC --> POS2["Print how long it took (fetch + extract, apply)<br/>and the binlog position it reached"]
     POS2 --> MORE
     MORE -->|"no"| RMKEY["Delete the key file"]
     RMKEY --> DIRS["Create relaylog, doublebuff, binlog and log,<br/>chown to mysql, restorecon"]
@@ -66,7 +66,7 @@ flowchart TD
     CLOSED -->|"did not start"| F1["Fail"]:::fail
     CLOSED --> GOT{"mysqld really has<br/>--skip-networking?"}
     GOT -->|"no: /etc/sysconfig/mysql overrode it"| F2["Stop mysqld, fail:<br/>never left open by mistake"]:::fail
-    GOT -->|"yes"| DONE(["Print: MySQL is closed, the next binlog<br/>to replay, what changed"]):::ok
+    GOT -->|"yes"| DONE(["Print: how long each backup took, MySQL is closed,<br/>the next binlog to replay, what changed"]):::ok
 
     classDef fail fill:#ffebe9,stroke:#cf222e,color:#1f2328
     classDef ok fill:#dafbe1,stroke:#1a7f37,color:#1f2328
@@ -74,12 +74,23 @@ flowchart TD
 
 Each incremental is extracted, applied and deleted before the next one, so `INCREMENTAL_DIR` never holds more than one.
 
-Each step prints the position it reached, for example:
+Each step prints how long it took and the position it reached, and the end sums the durations up, for example:
 
 ```
+Full backup: fetch + extract: 0h 41m 12s, prepare: 0h 6m 3s
 Full backup reached: mysql-bin.000150, position 4571 (backup ended 2026-11-02 03:12:44)
+Incremental 1 of 2: fetch + extract: 0h 3m 10s, apply: 0h 1m 2s
 Incremental backup 1 of 2 reached: mysql-bin.000171, position 982 (backup ended 2026-11-03 01:40:10)
+Incremental 2 of 2: fetch + extract: 0h 2m 55s, apply: 0h 0m 58s
 Incremental backup 2 of 2 reached: mysql-bin.000190, position 1337 (backup ended 2026-11-04 01:38:52)
+...
+Restore Completed - ⏳ Total restore duration: 0h 56m 40s
+
+How long each backup took:
+  - Full backup: fetch + extract: 0h 41m 12s, prepare: 0h 6m 3s
+  - Incremental 1 of 2: fetch + extract: 0h 3m 10s, apply: 0h 1m 2s
+  - Incremental 2 of 2: fetch + extract: 0h 2m 55s, apply: 0h 0m 58s
+...
 Next binlog to replay (the restored data ends here): mysql-bin.000190, position 1337 (backup ended 2026-11-04 01:38:52)
 ```
 
@@ -97,11 +108,16 @@ flowchart TD
     NEXT -->|"yes"| GET["Stream it from the bucket, decrypted on the way"]
     GET -->|"failed"| F1["Delete the whole folder, fail:<br/>an incomplete set must not be replayed"]:::fail
     GET -->|"ok"| NEXT
-    NEXT -->|"no more"| PRINT(["Print the GTID check, the replay command<br/>and the stop options. The script ends"]):::ok
+    NEXT -->|"no more"| ENDG["Read the GTIDs in the last binlog (mysqlbinlog):<br/>where the replay ends"]
+    ENDG -->|"unreadable"| F2["Fail: the binlogs stay, check them"]:::fail
+    ENDG -->|"ok"| PRINT(["Print the GTID check, the faster setting, the replay command,<br/>the stop options and the progress command. The script ends"]):::ok
     PRINT --> GTID["The GTIDs in the backup and on the server must match"]:::dba
     GTID --> FIND["Find where to stop:<br/>mysqlbinlog --base64-output=decode-rows --verbose"]:::dba
-    FIND --> REPLAY["Replay: mysqlbinlog --disable-log-bin ... | mysql --binary-mode"]:::dba
-    REPLAY --> CHECK["Check the data"]:::dba
+    FIND --> FAST["SET GLOBAL innodb_flush_log_at_trx_commit = 2"]:::dba
+    FAST --> REPLAY["Replay: mysqlbinlog --disable-log-bin ... | mysql --binary-mode<br/>(progress in a second terminal: watch ... GTID_SUBTRACT)"]:::dba
+    REPLAY --> DIED{"Did the replay die?"}:::dba
+    DIED -->|"yes: fix the cause"| REPLAY
+    DIED -->|"no"| CHECK["Check the data"]:::dba
     CHECK --> OPEN["systemctl restart mysqld: MySQL opens"]:::dba
 
     classDef fail fill:#ffebe9,stroke:#cf222e,color:#1f2328
@@ -113,6 +129,10 @@ flowchart TD
 - **Which date folders:** from the day before the backup ended. Older folders can hold the same numbers from an old sequence.
 - **Refused:** a missing number is a gap the replay can't cross, and a repeated one means two sequences.
 - **Why on disk:** `mysqlbinlog` must read all the binlogs in one process, so they can't be streamed into the replay.
+- **Where the replay starts** is printed before anything is fetched, so it is in the log even if the fetch fails.
+- **The faster setting:** `innodb_flush_log_at_trx_commit = 2` for the replay, so commits don't wait for a disk flush. The restart that opens MySQL puts back the value from `my.cnf`. A crash of the server during the replay can lose its last second: run the replay again.
+- **Progress:** the fetch reads where the replay ends from the last binlog (its earlier GTIDs, then its own), and prints a command for a second terminal: `GTID_SUBTRACT` shows the GTIDs still to replay, and nothing once every fetched binlog is replayed. With a stop option, what is left at the end is what you chose not to replay.
+- **If the replay dies** (an error, a lost terminal): fix the cause and run the same command again. The server skips every transaction it already has, by its GTID, and goes on from the first one it doesn't have. A transaction cut off halfway was rolled back, so it runs again in full. This needs GTIDs on the server the binlogs came from; without them, the script says a rerun would apply transactions twice.
 
 The stop options:
 
@@ -164,8 +184,11 @@ gcloud storage ls --long --readable-sizes gs://BUCKET/ | grep -E 'xbstream|xbcry
 # 5. Fetch the binlogs of the server the backups came from. Copy in any binlog saved by hand.
 /opt/scripts/mysql_restore_v2.sh --fetch_binlogs <server>
 
-# 6. Check the GTIDs it printed, then replay. The script prints this command with the real position.
+# 6. Check the GTIDs it printed, make commits faster, then replay. The script prints these with the real values.
+mysql --login-path=local -e "SET GLOBAL innodb_flush_log_at_trx_commit = 2"
 mysqlbinlog --disable-log-bin --start-position=1337 --stop-datetime="2026-11-04 14:32:00" /backup/restore_binlogs/mysql-bin.* | mysql --login-path=local --binary-mode
+#    In a second terminal, the GTIDs still to replay (nothing when it is done). If the replay dies, run it again: it skips what is done.
+watch -n 10 "mysql --login-path=local -N -B -e \"SELECT GTID_SUBTRACT('<printed by the fetch>', @@GLOBAL.gtid_executed)\""
 
 # 7. Check the data, then open MySQL and delete the unencrypted binlogs.
 systemctl restart mysqld
@@ -194,7 +217,7 @@ mv /root/mysql_backup /root/mysql_binlog_backup /etc/cron.d/
 ## Limits
 
 - **A restore to an older point:** the new binlog chain can reach names the old chain has in the bucket. Its upload then fails (it never overwrites), and a later `--fetch_binlogs` refuses two sequences with the same numbers. Move the old chain's binlogs from those numbers on out of the server's folder.
-- **Replay speed:** `mysqlbinlog | mysql` applies one transaction at a time. Measure it on a real server before counting on it.
+- **Replay speed:** `mysqlbinlog | mysql` applies one transaction at a time, with a round trip to the server for every event. In the lab (a t3.medium with gp3 disks, 606 MB of binlogs, 199,108 transactions of 5 inserts and 5 updates each), it took 1212 s with `innodb_flush_log_at_trx_commit = 1` and 821 s with `= 2`: a third less. A replay killed halfway and run again first skipped the 107,000 transactions already applied, in about 130 s. Measure it on a real server before counting on it.
 - **`PREPARE_MEMORY`:** too much can OOM the server, because xtrabackup can't use huge pages reserved for MySQL. Use about half of `MemAvailable`, checked with MySQL stopped.
 
 ## What it writes
@@ -206,5 +229,5 @@ mv /root/mysql_backup /root/mysql_binlog_backup /etc/cron.d/
 | `/backup/restore_binlogs` | The fetched binlogs, **not encrypted**, readable by root only. A DBA deletes them. |
 | `/backup/restore_shell` | The unpacked MySQL Shell dump, **not encrypted**, readable by root only. A DBA deletes it. |
 | `/dev/shm/mysql_restore_key.*` | The key file, readable by root only, for the run only |
-| `/var/log/mysql/mysql_restore.log` | The last run, with colors (`less -R`). Each run replaces it, so `--fetch_binlogs` replaces the restore's log. |
+| `/var/log/mysql/mysql_restore.log` | Every run, with colors (`less -R`), each starting with a header line. A restore or a MySQL Shell fetch starts a new log, and `--fetch_binlogs` adds to the bottom, so a restore and its binlog fetch stay in one file. |
 | Deleted | `/opt/scripts/mysql_backup.state` and `/opt/scripts/mysql_binlog_backup.state`: the two chain states |
