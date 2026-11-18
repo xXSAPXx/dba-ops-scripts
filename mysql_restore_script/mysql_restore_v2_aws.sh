@@ -46,7 +46,8 @@ ulimit -c 0
 # 3) Prepares each backup with a separate command (--use-memory=PREPARE_MEMORY), with --apply-log-only for all but the last one.
 # 4) Restores the incremental backups one at a time: extract, apply, delete. INCREMENTAL_DIR never holds more than one.
 # 5) Reads the encryption key from AWS Secrets Manager into a file on the RAM disk (/dev/shm), removed when the script ends.
-# 6) Logs the whole run to LOG_FILE, and ends with the total duration and what changed with the restore.
+# 6) Logs every run to LOG_FILE: a restore or a MySQL Shell fetch starts a new log, --fetch_binlogs adds to the bottom of the restore's log.
+#    Prints how long each backup took (fetch + extract, then prepare), and ends with a summary of the durations and what changed with the restore.
 # 7) Deletes the backup chains of this server: the incremental one (BACKUP_CHAIN_STATE), so the next incremental backup fails until a full backup
 #    runs, and the binlog one (BINLOG_CHAIN_STATE), so the next binlog backup fails until a person starts a new chain.
 # 8) A MySQL Shell archive (full-instance-backup-<time>.tar.xbcrypt) is only fetched: streamed from the bucket, decrypted and unpacked into
@@ -56,6 +57,7 @@ ulimit -c 0
 #     works, with no replication and no scheduled events. It stays closed until a person runs: systemctl restart mysqld
 # 11) --fetch_binlogs <server>, after an XtraBackup restore, only fetches the binlogs: streamed from the bucket and decrypted into BINLOG_RESTORE_DIR,
 #     from the position the data reached. A DBA then replays them by hand with mysqlbinlog (the script prints how), up to the chosen moment.
+#     It prints where the replay starts before anything is fetched, and with the replay commands how to follow its progress (GTIDs).
 # WARNING: an XtraBackup restore stops MySQL and deletes everything in the datadir, and MySQL stays closed to clients until it is restarted by hand.
 
 # === Colors ===
@@ -66,6 +68,7 @@ YELLOW="\e[33m"
 RESET="\e[0m"
 
 # === Log file ===
+# A restore or a MySQL Shell fetch replaces it. --fetch_binlogs adds to it, below the restore it follows:
 LOG_FILE="/var/log/mysql/mysql_restore.log"
 
 # === Settings ===
@@ -142,6 +145,12 @@ fail(){
 }
 
 
+# Function to print a number of seconds as a duration (1h 2m 3s):
+format_duration(){
+    echo "$(($1 / 3600))h $((($1 % 3600) / 60))m $(($1 % 60))s"
+}
+
+
 # Function to restore one backup into a folder with one command: streamed from the bucket, then decrypted and decompressed by xbstream.
 # xbstream 8.4 prints "encryption: both encryption key and key file specified." a few times: harmless, only the key file is given:
 restore_backup(){
@@ -176,7 +185,20 @@ echo
 echo "======================================================================================================================"
 echo
 
-exec > >(tee "$LOG_FILE") 2>&1
+# A restore or a MySQL Shell fetch starts a new log. --fetch_binlogs follows a restore, so it goes at the bottom of that restore's log.
+# Each run starts with a header line: when, on which server, and what it does:
+if [ -n "$SOURCE_SERVER" ]; then
+    exec > >(tee -a "$LOG_FILE") 2>&1
+    RUN_HEADER="Fetch of the binlogs of $SOURCE_SERVER"
+elif [ -n "$DUMP_FOLDER" ]; then
+    exec > >(tee "$LOG_FILE") 2>&1
+    RUN_HEADER="Fetch of the MySQL Shell archive $FULL_BACKUP"
+else
+    exec > >(tee "$LOG_FILE") 2>&1
+    RUN_HEADER="XtraBackup restore: $FULL_BACKUP + ${#INCREMENTAL_BACKUPS[@]} incremental backup(s)"
+fi
+echo
+echo -e "${CYAN}===== $(date '+%Y-%m-%d %H:%M:%S') | $(hostname -s) | $RUN_HEADER =====${RESET}"
 
 START_TIME="$(date +%s)"
 echo -e "${GREEN}Restore started at: $(date) ${RESET}"
@@ -194,6 +216,13 @@ if [ -n "$SOURCE_SERVER" ]; then
 
     # The replay starts inside the binary log the restored data ended in:
     read -r START_BINLOG START_POSITION _ < "$DATA_DIR/xtrabackup_binlog_info"
+    # The GTID set is the third column. The server prints a line for each server_uuid in it, so the spaces and new lines go to compare them:
+    GTIDS_IN_BACKUP=$(cut -f3- "$DATA_DIR/xtrabackup_binlog_info" | tr -d '\n ')
+    # Where the replay starts, printed before anything is fetched, so it is in the log even if the fetch fails:
+    echo -e "${CYAN}The replay starts where the restored backup ended:${RESET}"
+    echo -e "  - Binlog: $START_BINLOG, position $START_POSITION"
+    echo -e "  - The backup ended at: $(sed -n 's/^end_time = //p' "$DATA_DIR/xtrabackup_info")"
+    echo -e "  - GTIDs in the backup: $GTIDS_IN_BACKUP"
 
     # Only the date folders from the backup's end on, and a day before it for a binlog uploaded just before a backup ended around midnight:
     # after an earlier restore, older date folders can hold the same binlog numbers from the old sequence:
@@ -262,13 +291,27 @@ if [ -n "$SOURCE_SERVER" ]; then
     done
     echo
 
-    FETCH_DURATION=$(($(date +%s) - START_TIME))
-    echo -e "${GREEN}Fetch Completed - ⏳ Total duration: $((FETCH_DURATION / 3600))h $(((FETCH_DURATION % 3600) / 60))m $((FETCH_DURATION % 60))s ${RESET}"
+    echo -e "${GREEN}Fetch Completed - ⏳ Total duration: $(format_duration $(($(date +%s) - START_TIME))) ${RESET}"
     echo
 
-    # The GTID set is the third column. The server prints a line for each server_uuid in it, so the spaces and new lines go to compare them:
-    GTIDS_IN_BACKUP=$(cut -f3- "$DATA_DIR/xtrabackup_binlog_info" | tr -d '\n ')
+    # Where the replay ends: the last binlog fetched (BINLOG, after the loop) lists the GTIDs before it (Previous-GTIDs), then holds its own,
+    # from the first to the last of each server_uuid. MySQL works out the rest: GTID_SUBTRACT gives what is still to replay, also during the replay:
+    echo -e "${YELLOW}Reading the GTIDs in $BINLOG...${RESET}"
+    GTIDS_AT_END=$(mysqlbinlog "$BINLOG_RESTORE_DIR/$BINLOG" | awk '
+        /Previous-GTIDs[[:space:]]*$/ { previous = 1; next }
+        previous && /^# [0-9a-f-]+:/ { gtids = gtids substr($0, 3); next }
+        { previous = 0 }
+        /GTID_NEXT= .[0-9a-f-]+:[0-9]+./ {
+            split($0, quoted, "\047"); split(quoted[2], gtid, ":"); number = gtid[2] + 0
+            if (!(gtid[1] in first) || number < first[gtid[1]]) first[gtid[1]] = number
+            if (number > last[gtid[1]]) last[gtid[1]] = number
+        }
+        END { for (uuid in first) gtids = gtids (gtids == "" ? "" : ",") uuid ":" first[uuid] "-" last[uuid]; print gtids }') || \
+        fail "mysqlbinlog could not read $BINLOG (see above). The binlogs are fetched into $BINLOG_RESTORE_DIR: check them before a replay."
     GTIDS_ON_SERVER=$(mysql --login-path=local -N -B -r -e "SELECT @@GLOBAL.gtid_executed" | tr -d '\n ') || GTIDS_ON_SERVER="(unable to read it: check mysql --login-path=local)"
+    GTIDS_TO_REPLAY=""
+    [ -z "$GTIDS_AT_END" ] || GTIDS_TO_REPLAY=$(mysql --login-path=local -N -B -r -e "SELECT GTID_SUBTRACT('$GTIDS_AT_END', @@GLOBAL.gtid_executed)" | tr -d '\n ') || \
+        GTIDS_TO_REPLAY="(unable to read it: check mysql --login-path=local)"
 
     echo -e "${CYAN}Nothing is replayed yet. First, the server must be where the backup ended, so these two must match:${RESET}"
     echo -e "  - GTIDs in the backup: $GTIDS_IN_BACKUP"
@@ -276,6 +319,9 @@ if [ -n "$SOURCE_SERVER" ]; then
     echo
     echo -e "${CYAN}Then find where to stop, reading the binlogs as text:${RESET}"
     echo -e "  mysqlbinlog --base64-output=decode-rows --verbose --start-position=$START_POSITION $BINLOG_RESTORE_DIR/${START_BINLOG%.*}.* | less"
+    echo
+    echo -e "${CYAN}Before the replay, make commits faster: no disk flush at every commit. The restart at the end (systemctl restart mysqld) sets it back:${RESET}"
+    echo -e "  mysql --login-path=local -e \"SET GLOBAL innodb_flush_log_at_trx_commit = 2\""
     echo
     echo -e "${CYAN}Then replay, with one stop option or none. One command for all the binlogs (--start-position applies to the first one):${RESET}"
     echo -e "  mysqlbinlog --disable-log-bin --start-position=$START_POSITION <stop option> $BINLOG_RESTORE_DIR/${START_BINLOG%.*}.* | mysql --login-path=local --binary-mode"
@@ -286,9 +332,22 @@ if [ -n "$SOURCE_SERVER" ]; then
     echo -e "  - Stop just before a bad statement:      --stop-position=<position> (applies to the last file named: name the files one by one, up to that file)"
     echo -e "  - Skip one bad transaction, keep the rest: --exclude-gtids='<uuid>:<number>' (only if later transactions do not depend on it)"
     echo
+    if [ -n "$GTIDS_AT_END" ]; then
+        echo -e "${CYAN}The replay's progress, in a second terminal: the GTIDs still to replay. Now: $GTIDS_TO_REPLAY${RESET}"
+        echo -e "${CYAN}Nothing is left once every fetched binlog is replayed. With a stop option, what is left at the end is what you chose not to replay.${RESET}"
+        echo -e "  watch -n 10 \"mysql --login-path=local -N -B -e \\\"SELECT GTID_SUBTRACT('$GTIDS_AT_END', @@GLOBAL.gtid_executed)\\\"\""
+        echo
+        echo -e "${CYAN}If the replay dies (an error, a lost terminal): fix the cause and run the same replay command again.${RESET}"
+        echo -e "  The server skips every transaction it already has (by its GTID) and goes on from the first one it does not have."
+        echo -e "  Skipping is quicker than replaying, but not instant: the command reads through the skipped binlogs again."
+    else
+        echo -e "${CYAN}These binlogs have no GTIDs: if the replay dies, it can't simply run again (it would apply transactions twice).${RESET}"
+    fi
+    echo
     echo -e "${CYAN}Reminders for the replay:${RESET}"
     echo -e "  - Binlogs not in the bucket yet (kept from the old server)? Copy them into $BINLOG_RESTORE_DIR first: mysqlbinlog also reads one that was not closed."
     echo -e "  - --disable-log-bin keeps the replayed data out of this server's binlogs (each transaction leaves only an empty GTID entry), so replicas do not get it: rebuild them from a new backup."
+    echo -e "  - With innodb_flush_log_at_trx_commit = 2, a crash of the server can lose its last second of the replay: run the replay again."
     echo -e "  - MySQL stays CLOSED to clients until the replay is done and you run: systemctl restart mysqld"
     echo -e "  - The binlogs are not encrypted. When you finish: rm -rf $BINLOG_RESTORE_DIR"
     exit 0
@@ -307,8 +366,7 @@ if [ -n "$DUMP_FOLDER" ]; then
         fail "The fetch failed (see above) and the incomplete folder was deleted. MySQL was not touched."; }
     echo
 
-    FETCH_DURATION=$(($(date +%s) - START_TIME))
-    echo -e "${GREEN}Fetch Completed - ⏳ Total duration: $((FETCH_DURATION / 3600))h $(((FETCH_DURATION % 3600) / 60))m $((FETCH_DURATION % 60))s ${RESET}"
+    echo -e "${GREEN}Fetch Completed - ⏳ Total duration: $(format_duration $(($(date +%s) - START_TIME))) ${RESET}"
     echo
     echo -e "${CYAN}Nothing is restored yet. Choose what to load, in MySQL Shell (mysqlsh --login-path=local --js):${RESET}"
     echo -e "  - Check first, without changing anything: util.loadDump('$DUMP_FOLDER', {dryRun: true})"
@@ -344,9 +402,13 @@ echo -e "${YELLOW}Incremental backup chain and binlog chain stopped (${BACKUP_CH
 echo
 
 # === Full backup: straight into the datadir ===
+# How long each backup took, for the summary at the end:
+DURATIONS=()
 echo -e "${YELLOW}Starting restore from the full backup $FULL_BACKUP...${RESET}"
+STEP_START=$(date +%s)
 restore_backup "$FULL_BACKUP" "$DATA_DIR"
-echo -e "${YELLOW}Restore finished at: $(date) ${RESET}"
+FETCH_TIME=$(format_duration $(($(date +%s) - STEP_START)))
+echo -e "${YELLOW}Restore finished at: $(date) (fetch + extract: $FETCH_TIME)${RESET}"
 echo
 
 # With incremental backups to follow, --apply-log-only: redo only, no rollback of the open transactions yet,
@@ -354,8 +416,12 @@ echo
 APPLY_LOG_ONLY=""
 [ ${#INCREMENTAL_BACKUPS[@]} -gt 0 ] && APPLY_LOG_ONLY="--apply-log-only"
 echo -e "${YELLOW}Preparing the full backup ${APPLY_LOG_ONLY}...${RESET}"
+STEP_START=$(date +%s)
 xtrabackup --prepare $APPLY_LOG_ONLY --use-memory="$PREPARE_MEMORY" --target-dir="$DATA_DIR"
-echo -e "${YELLOW}Backup prepared at: $(date) ${RESET}"
+PREPARE_TIME=$(format_duration $(($(date +%s) - STEP_START)))
+echo -e "${YELLOW}Backup prepared at: $(date) (prepare: $PREPARE_TIME)${RESET}"
+DURATIONS+=("Full backup: fetch + extract: $FETCH_TIME, prepare: $PREPARE_TIME")
+echo -e "${YELLOW}${DURATIONS[-1]}${RESET}"
 show_binlog_position "Full backup reached"
 echo
 
@@ -370,13 +436,19 @@ for i in "${!INCREMENTAL_BACKUPS[@]}"; do
     echo -e "${YELLOW}Starting restore from incremental backup $((i + 1)) of ${#INCREMENTAL_BACKUPS[@]}: $BACKUP...${RESET}"
     rm -rf "$INCREMENTAL_DIR"
     mkdir -p "$INCREMENTAL_DIR"
+    STEP_START=$(date +%s)
     restore_backup "$BACKUP" "$INCREMENTAL_DIR"
-    echo -e "${YELLOW}Restore finished at: $(date) ${RESET}"
+    FETCH_TIME=$(format_duration $(($(date +%s) - STEP_START)))
+    echo -e "${YELLOW}Restore finished at: $(date) (fetch + extract: $FETCH_TIME)${RESET}"
     echo
     echo -e "${YELLOW}Applying incremental backup $((i + 1)) to ${DATA_DIR} ${APPLY_LOG_ONLY}...${RESET}"
+    STEP_START=$(date +%s)
     xtrabackup --prepare $APPLY_LOG_ONLY --use-memory="$PREPARE_MEMORY" --target-dir="$DATA_DIR" --incremental-dir="$INCREMENTAL_DIR"
+    APPLY_TIME=$(format_duration $(($(date +%s) - STEP_START)))
     rm -rf "$INCREMENTAL_DIR"
-    echo -e "${YELLOW}Incremental backup applied and its folder deleted at: $(date) ${RESET}"
+    echo -e "${YELLOW}Incremental backup applied and its folder deleted at: $(date) (apply: $APPLY_TIME)${RESET}"
+    DURATIONS+=("Incremental $((i + 1)) of ${#INCREMENTAL_BACKUPS[@]}: fetch + extract: $FETCH_TIME, apply: $APPLY_TIME")
+    echo -e "${YELLOW}${DURATIONS[-1]}${RESET}"
     show_binlog_position "Incremental backup $((i + 1)) of ${#INCREMENTAL_BACKUPS[@]} reached"
     echo
 done
@@ -405,13 +477,10 @@ grep -qa -- --skip-networking "/proc/$(systemctl show --property=MainPID --value
 echo -e "${YELLOW}Started mysqld, CLOSED to clients.${RESET}"
 trap - ERR
 echo
-END_TIME=$(date +%s)
-RESTORE_DURATION=$((END_TIME - START_TIME))
-# Convert seconds to hours/minutes/seconds
-HOURS=$((RESTORE_DURATION / 3600))
-MINUTES=$(((RESTORE_DURATION % 3600) / 60))
-SECONDS=$((RESTORE_DURATION % 60))
-echo -e "${GREEN}Restore Completed - ⏳ Total restore duration: ${HOURS}h ${MINUTES}m ${SECONDS}s ${RESET}"
+echo -e "${GREEN}Restore Completed - ⏳ Total restore duration: $(format_duration $(($(date +%s) - START_TIME))) ${RESET}"
+echo
+echo -e "${CYAN}How long each backup took:${RESET}"
+for LINE in "${DURATIONS[@]}"; do echo -e "  - $LINE"; done
 echo
 
 # === MySQL is closed, and where the restored data ends ===
