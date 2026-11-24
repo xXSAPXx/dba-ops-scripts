@@ -1,0 +1,10 @@
+/var/log/postgresql_backup.log {
+    weekly
+    maxsize 50M
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root root
+}
